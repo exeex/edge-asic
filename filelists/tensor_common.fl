@@ -1,2 +1,3 @@
 rtl/tensor/edge_bf16_sig_mul.v
 rtl/tensor/edge_dot8_kernel.v
+rtl/tensor/edge_psum.v
