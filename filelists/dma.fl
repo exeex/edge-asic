@@ -1,0 +1,2 @@
+rtl/dma/edge_dma_read_fifo.v
+rtl/dma/edge_dma_a2d_stream.v
