@@ -1,0 +1,4 @@
+rtl/accel_io/edge_accel_io.v
+rtl/accel_io/edge_accel_core_mux.v
+rtl/accel_io/edge_accel_io_unit.v
+rtl/accel_io/edge_accel_unit.v
