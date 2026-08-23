@@ -216,7 +216,7 @@ endmodule
 //       successive row sums in the private BF22 RSUM accumulator
 //   r6: emit one BF16 result when the RSUM sequence marks its last row
 
-module edge_dot8_kernel #(
+module edge_dot_kernel #(
   parameter PARTIAL_ONLY = 0,
   parameter FPGA_DSP_ADD = 0,
   parameter FPGA_DSP_MUL = 0,
