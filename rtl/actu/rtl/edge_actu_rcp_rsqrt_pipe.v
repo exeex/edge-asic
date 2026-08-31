@@ -54,20 +54,20 @@ wire [16:0] seed_q16;
 wire [17:0] mant_q16;
 wire [17:0] norm_q16;
 wire        invalid_input;
-wire [35:0] common_mul_product;
-wire [35:0] common_mul_rounded;
+wire [27:0] common_mul_product;
+wire [27:0] common_mul_rounded;
 wire [17:0] common_mul_q16;
 wire [17:0] rcp_corr_q16;
-wire [35:0] rsqrt_t1_product;
-wire [35:0] rsqrt_t1_rounded;
+wire [27:0] rsqrt_t1_product;
+wire [27:0] rsqrt_t1_rounded;
 wire [17:0] rsqrt_t1_q16;
-wire [35:0] rcp_result_product;
-wire [35:0] rcp_result_rounded;
+wire [27:0] rcp_result_product;
+wire [27:0] rcp_result_rounded;
 wire [17:0] rcp_result_q16;
 wire [17:0] rsqrt_half_q16;
 wire [17:0] rsqrt_corr_q16;
-wire [35:0] rsqrt_result_product;
-wire [35:0] rsqrt_result_rounded;
+wire [27:0] rsqrt_result_product;
+wire [27:0] rsqrt_result_rounded;
 wire [17:0] rsqrt_result_q16;
 wire signed [10:0] scale_exp;
 wire signed [10:0] exp_s3_ext;
@@ -93,29 +93,32 @@ edge_actu_rcp_rsqrt_seed_q16 x_seed (
   .seed_q16(seed_q16)
 );
 
-// Both operations start with the same Q16 product m*y0.  The shared first
-// multiplier therefore has no mode-dependent operand mux.
-assign common_mul_product = norm_s0 * seed_s0;
-assign common_mul_rounded = common_mul_product + 36'h0000_8000;
-assign common_mul_q16 = common_mul_rounded[33:16];
+// Both operations start with the same product m*y0.  Keep the registered
+// state/result in Q16, but truncate the multiplier operands to 14 bits.  Norm
+// needs two integer bits (Q12); the seed remains Q13.  The product is rounded
+// once, back into the Q16 accumulator domain.
+assign common_mul_product = norm_s0[17:4] * seed_s0[16:3];
+assign common_mul_rounded = common_mul_product + 28'h0000100;
+assign common_mul_q16 = common_mul_rounded[26:9];
 
 // RCP S2 is correction-only.  RSQRT uses the same cycle for its second
-// product, forming m*y0*y0 with one rounded Q16 product per stage.
+// product, forming m*y0*y0 with one rounded Q16 result per stage.  The S1
+// result can reach 2 for odd-exponent RSQRT, so it keeps two integer bits.
 assign rcp_corr_q16 = 18'h20000 - common_mul_s1;
-assign rsqrt_t1_product = common_mul_s1 * seed_s1;
-assign rsqrt_t1_rounded = rsqrt_t1_product + 36'h0000_8000;
-assign rsqrt_t1_q16 = rsqrt_t1_rounded[33:16];
+assign rsqrt_t1_product = common_mul_s1[17:4] * seed_s1[16:3];
+assign rsqrt_t1_rounded = rsqrt_t1_product + 28'h0000100;
+assign rsqrt_t1_q16 = rsqrt_t1_rounded[26:9];
 
 // RCP S3 is its final multiply.  RSQRT S3 is correction-only; multiplying
 // by 0.5 is a fixed-point right shift and does not infer a multiplier.
-assign rcp_result_product = seed_s2 * rcp_corr_s2;
-assign rcp_result_rounded = rcp_result_product + 36'h0000_8000;
-assign rcp_result_q16 = rcp_result_rounded[33:16];
+assign rcp_result_product = seed_s2[16:3] * rcp_corr_s2[16:3];
+assign rcp_result_rounded = rcp_result_product + 28'h0000200;
+assign rcp_result_q16 = rcp_result_rounded[27:10];
 assign rsqrt_half_q16 = rsqrt_t1_s2 >> 1;
 assign rsqrt_corr_q16 = 18'h18000 - rsqrt_half_q16;
-assign rsqrt_result_product = seed_s3 * rsqrt_corr_s3;
-assign rsqrt_result_rounded = rsqrt_result_product + 36'h0000_8000;
-assign rsqrt_result_q16 = rsqrt_result_rounded[33:16];
+assign rsqrt_result_product = seed_s3[16:3] * rsqrt_corr_s3[16:3];
+assign rsqrt_result_rounded = rsqrt_result_product + 28'h0000200;
+assign rsqrt_result_q16 = rsqrt_result_rounded[27:10];
 
 assign exp_s3_ext = {exp_s4[9], exp_s4};
 assign scale_exp = rsqrt_s4 ? -(exp_s3_ext >>> 1) : -exp_s3_ext;
