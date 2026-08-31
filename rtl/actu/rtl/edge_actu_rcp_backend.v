@@ -19,7 +19,7 @@ module edge_actu_rcp_backend #(
   output wire [2:0]  out_mode,
   output wire [18:0] out_payload_bf19,
   output wire [21:0] out_primary_bf22,
-  output wire [31:0] out_rcp_bits,
+  output wire [21:0] out_rcp_bf22,
   output wire        out_sum_clear
 );
 
@@ -35,6 +35,12 @@ reg [2:0]   mode_pipe [0:ALIGN_LATENCY-1];
 reg [18:0]  payload_pipe [0:ALIGN_LATENCY-1];
 reg [21:0]  primary_pipe [0:ALIGN_LATENCY-1];
 reg         sum_clear_pipe [0:ALIGN_LATENCY-1];
+reg         egress_valid_q;
+reg [2:0]   egress_mode_q;
+reg [18:0]  egress_payload_q;
+reg [21:0]  egress_primary_q;
+reg [21:0]  egress_rcp_q;
+reg         egress_sum_clear_q;
 integer stage;
 
 wire nonlinear_valid;
@@ -50,12 +56,12 @@ edge_actu_rcp_rsqrt_pipe x_rcp_rsqrt (
   .out_value(nonlinear_bits)
 );
 
-assign out_valid = nonlinear_valid;
-assign out_mode = mode_pipe[ALIGN_LATENCY-1];
-assign out_payload_bf19 = payload_pipe[ALIGN_LATENCY-1];
-assign out_primary_bf22 = primary_pipe[ALIGN_LATENCY-1];
-assign out_rcp_bits = nonlinear_bits;
-assign out_sum_clear = sum_clear_pipe[ALIGN_LATENCY-1];
+assign out_valid = egress_valid_q;
+assign out_mode = egress_mode_q;
+assign out_payload_bf19 = egress_payload_q;
+assign out_primary_bf22 = egress_primary_q;
+assign out_rcp_bf22 = egress_rcp_q;
+assign out_sum_clear = egress_sum_clear_q;
 
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
@@ -65,6 +71,12 @@ always @(posedge clk or negedge cpurst_b) begin
     ingress_primary_q <= 22'b0;
     ingress_divisor_q <= 22'b0;
     ingress_sum_clear_q <= 1'b0;
+    egress_valid_q <= 1'b0;
+    egress_mode_q <= 3'b0;
+    egress_payload_q <= 19'b0;
+    egress_primary_q <= 22'b0;
+    egress_rcp_q <= 22'b0;
+    egress_sum_clear_q <= 1'b0;
     for (stage = 0; stage < ALIGN_LATENCY; stage = stage + 1) begin
       mode_pipe[stage] <= 3'b0;
       payload_pipe[stage] <= 19'b0;
@@ -78,6 +90,12 @@ always @(posedge clk or negedge cpurst_b) begin
     ingress_primary_q <= in_primary_bf22;
     ingress_divisor_q <= in_divisor_bf22;
     ingress_sum_clear_q <= in_sum_clear;
+    egress_valid_q <= nonlinear_valid;
+    egress_mode_q <= mode_pipe[ALIGN_LATENCY-1];
+    egress_payload_q <= payload_pipe[ALIGN_LATENCY-1];
+    egress_primary_q <= primary_pipe[ALIGN_LATENCY-1];
+    egress_rcp_q <= nonlinear_bits[31:10];
+    egress_sum_clear_q <= sum_clear_pipe[ALIGN_LATENCY-1];
     mode_pipe[0] <= ingress_mode_q;
     payload_pipe[0] <= ingress_payload_q;
     primary_pipe[0] <= ingress_primary_q;

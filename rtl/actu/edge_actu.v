@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module edge_actu #(
-  parameter PIPE_STAGES = 14
+  parameter PIPE_STAGES = 15
 ) (
   input  wire        forever_cpuclk,
   input  wire        cpurst_b,
@@ -30,44 +30,20 @@ localparam [2:0] EDGE_ACTU_MODE_RSQRT    = 3'd6;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX_NORMALIZE = 3'd7;
 localparam integer NONLINEAR_LATENCY = 5;
 localparam integer TRANSPORT_LATENCY = 5;
+localparam integer BACKEND_EGRESS_LATENCY = 1;
 localparam integer POST_STAGES = PIPE_STAGES - NONLINEAR_LATENCY -
-                                 TRANSPORT_LATENCY;
-localparam integer VALUE_PIPE_LAST = POST_STAGES - 2;
+                                 TRANSPORT_LATENCY -
+                                 BACKEND_EGRESS_LATENCY;
 
-reg [POST_STAGES-1:0] valid_pipe;
-reg [2:0]             mode_pipe [0:POST_STAGES-1];
-reg [31:0]            value_pipe [0:POST_STAGES-1];
-reg [2:0]             final_mode_q;
-reg [18:0]            final_payload_q;
-reg [31:0]            final_sigmoid_q;
-reg [31:0]            final_direct_q;
-reg [31:0]            final_softmax_product_q;
-
-integer stage;
 wire   input_fire;
 wire [31:0] exp_input_bits;
-wire [31:0] exp_result_bits;
-wire [31:0] rcp_result_bits;
-wire [31:0] sigmoid_result_bits;
-wire [31:0] silu_result_bits;
-wire [31:0] tanh_result_bits;
-wire [31:0] softmax_result_bits;
-wire [31:0] softmax_normalize_bits;
-wire [31:0] softmax_product_bits;
-wire [31:0] final_direct_bits;
-wire [21:0] softmax_sum_next_bf22;
-wire [31:0] softmax_sum_next_bits;
-wire [31:0] stage0_result_bits;
 wire [31:0] neg_abs_bits;
 wire [31:0] neg_abs_x2_bits;
 wire [31:0] softmax_delta_bits;
-wire [31:0] sigmoid_bits;
-wire [31:0] silu_product_bits;
-wire [31:0] tanh_signed_bits;
 wire        fused_sigmoid_like;
 wire        fused_tanh_like;
 wire        nonlinear_out_valid;
-wire [31:0] nonlinear_out_bits;
+wire [21:0] nonlinear_out_bf22;
 wire        front_valid;
 wire [2:0]  front_mode;
 wire [18:0] front_payload_bf19;
@@ -78,145 +54,19 @@ wire        backend_sum_clear;
 wire [2:0]  aligned_mode;
 wire [18:0] aligned_payload_bf19;
 wire [21:0] aligned_primary_bf22;
-wire [31:0] aligned_payload_bits;
-wire [31:0] aligned_primary_bits;
-wire [31:0] aligned_rcp_internal_bits;
-reg  [21:0] softmax_sum_q;
+wire        finalizer_out_valid;
+wire [2:0]  finalizer_out_mode;
+wire [31:0] finalizer_out_value;
+wire        finalizer_sum_valid;
+wire [31:0] finalizer_sum_value;
 
 assign in_ready = cpurst_b;
 assign input_fire = in_valid && in_ready;
-assign out_valid = valid_pipe[POST_STAGES-1];
-assign out_mode = mode_pipe[POST_STAGES-1];
-assign out_value = value_pipe[VALUE_PIPE_LAST];
-
-function [31:0] bf16_round_bits;
-  input [31:0] bits;
-  reg [15:0] rounded;
-  begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      rounded = 16'h7fc0;
-    end else begin
-      rounded = bits[31:16] + {15'b0, (bits[15] && (|bits[14:0] || bits[16]))};
-      if ((rounded == 16'h0000) && bits[31])
-        rounded = 16'h8000;
-    end
-    bf16_round_bits = {rounded, 16'h0000};
-  end
-endfunction
-
-// ACTU-local positive BF22 accumulator.  Softmax EXP values and their running
-// sum are finite and non-negative, so the recurrence does not need the generic
-// FP32 sign/subtract/cancellation path or a linear left-normalization loop.
-// BF22 is encoded natively as sign/exponent/fraction = 1/8/13 bits.
-function [21:0] bf22_add_positive;
-  input [21:0] a;
-  input [21:0] b;
-  reg [7:0] a_exp;
-  reg [7:0] b_exp;
-  reg [7:0] large_exp;
-  reg [7:0] small_exp;
-  reg [13:0] a_sig;
-  reg [13:0] b_sig;
-  reg [13:0] large_main;
-  reg [14:0] rounded_main;
-  reg [18:0] large_sig;
-  reg [18:0] small_sig;
-  reg [18:0] norm_sig;
-  reg [19:0] sum;
-  reg sticky;
-  integer shift;
-  begin
-    a_exp = a[20:13];
-    b_exp = b[20:13];
-    a_sig = (a_exp == 0) ? {1'b0, a[12:0]} : {1'b1, a[12:0]};
-    b_sig = (b_exp == 0) ? {1'b0, b[12:0]} : {1'b1, b[12:0]};
-    if (a_sig == 0) begin
-      bf22_add_positive = b;
-    end else if (b_sig == 0) begin
-      bf22_add_positive = a;
-    end else begin
-      if ((b_exp > a_exp) || ((b_exp == a_exp) && (b_sig > a_sig))) begin
-        large_exp = (b_exp == 0) ? 8'd1 : b_exp;
-        small_exp = (a_exp == 0) ? 8'd1 : a_exp;
-        large_sig = {b_sig, 5'b0};
-        shift = {24'b0, large_exp} - {24'b0, small_exp};
-        if (shift >= 19)
-          small_sig = {18'b0, |a_sig};
-        else if (shift == 0)
-          small_sig = {a_sig, 5'b0};
-        else begin
-          sticky = |({a_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
-          small_sig = ({a_sig, 5'b0} >> shift) | {18'b0, sticky};
-        end
-      end else begin
-        large_exp = (a_exp == 0) ? 8'd1 : a_exp;
-        small_exp = (b_exp == 0) ? 8'd1 : b_exp;
-        large_sig = {a_sig, 5'b0};
-        shift = {24'b0, large_exp} - {24'b0, small_exp};
-        if (shift >= 19)
-          small_sig = {18'b0, |b_sig};
-        else if (shift == 0)
-          small_sig = {b_sig, 5'b0};
-        else begin
-          sticky = |({b_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
-          small_sig = ({b_sig, 5'b0} >> shift) | {18'b0, sticky};
-        end
-      end
-      sum = {1'b0, large_sig} + {1'b0, small_sig};
-      if (sum[19]) begin
-        norm_sig = {sum[19:2], |sum[1:0]};
-        large_exp = large_exp + 1'b1;
-      end else begin
-        norm_sig = sum[18:0];
-      end
-      large_main = norm_sig[18:5];
-      rounded_main = {1'b0, large_main} +
-                     (norm_sig[4] && (|norm_sig[3:0] || large_main[0]));
-      if ((large_exp == 8'hff) ||
-          ((large_exp == 8'hfe) && rounded_main[14])) begin
-        bf22_add_positive = {1'b0, 8'hfe, 13'h1fff};
-      end else if (rounded_main[14]) begin
-        bf22_add_positive = {1'b0, large_exp + 1'b1,
-                             rounded_main[13:1]};
-      end else begin
-        bf22_add_positive = {1'b0, large_exp, rounded_main[12:0]};
-      end
-    end
-  end
-endfunction
-
-function [31:0] bf22_round_bits;
-  input [31:0] bits;
-  reg [31:0] rounded_bits;
-  reg [31:0] bias;
-  begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      bf22_round_bits = 32'h7fc0_0000;
-    end else begin
-      bias = 32'h0000_01ff + {31'b0, bits[10]};
-      rounded_bits = (bits + bias) & 32'hffff_fc00;
-      bf22_round_bits = rounded_bits;
-    end
-  end
-endfunction
-
-// Shared fused-finalizer multiplier operands use BF19 (1/8/10).  Keeping the
-// truncation explicit lets synthesis reduce every significand multiplier to
-// the same 11x11 implementation while EXP/RCP forwarding remains BF22.
-function [31:0] bf19_round_bits;
-  input [31:0] bits;
-  reg [31:0] rounded_bits;
-  reg [31:0] bias;
-  begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      bf19_round_bits = 32'h7fc0_0000;
-    end else begin
-      bias = 32'h0000_0fff + {31'b0, bits[13]};
-      rounded_bits = (bits + bias) & 32'hffff_e000;
-      bf19_round_bits = rounded_bits;
-    end
-  end
-endfunction
+assign out_valid = finalizer_out_valid;
+assign out_mode = finalizer_out_mode;
+assign out_value = finalizer_out_value;
+assign softmax_sum_valid = finalizer_sum_valid;
+assign softmax_sum_value = finalizer_sum_value;
 
 function [26:0] rshift_sticky27;
   input [26:0] value;
@@ -361,47 +211,6 @@ function [31:0] fp32_sub_bits;
   end
 endfunction
 
-function [31:0] fp32_mul_bits;
-  input [31:0] a_bits;
-  input [31:0] b_bits;
-  reg        sign_z;
-  reg [7:0]  exp_a_bits;
-  reg [7:0]  exp_b_bits;
-  reg [23:0] sig_a;
-  reg [23:0] sig_b;
-  reg signed [11:0] exp_a;
-  reg signed [11:0] exp_b;
-  reg signed [11:0] exp_z;
-  reg [47:0] product;
-  reg [26:0] sig_grs;
-  begin
-    sign_z = a_bits[31] ^ b_bits[31];
-    exp_a_bits = a_bits[30:23];
-    exp_b_bits = b_bits[30:23];
-    if (a_bits[30:0] == 31'b0 || b_bits[30:0] == 31'b0) begin
-      fp32_mul_bits = {sign_z, 31'b0};
-    end else if (exp_a_bits == 8'hff || exp_b_bits == 8'hff) begin
-      fp32_mul_bits = 32'h7fc0_0000;
-    end else begin
-      sig_a = (exp_a_bits == 8'b0) ? {1'b0, a_bits[22:0]} :
-                                      {1'b1, a_bits[22:0]};
-      sig_b = (exp_b_bits == 8'b0) ? {1'b0, b_bits[22:0]} :
-                                      {1'b1, b_bits[22:0]};
-      exp_a = (exp_a_bits == 8'b0) ? -12'sd126 : ({4'b0, exp_a_bits} - 12'sd127);
-      exp_b = (exp_b_bits == 8'b0) ? -12'sd126 : ({4'b0, exp_b_bits} - 12'sd127);
-      product = sig_a * sig_b;
-      if (product[47]) begin
-        exp_z = exp_a + exp_b + 12'sd1;
-        sig_grs = {product[47:24], product[23], product[22], |product[21:0]};
-      end else begin
-        exp_z = exp_a + exp_b;
-        sig_grs = {product[46:23], product[22], product[21], |product[20:0]};
-      end
-      fp32_mul_bits = fp32_pack_from_grs(sign_z, exp_z, sig_grs);
-    end
-  end
-endfunction
-
 function [31:0] neg_abs_scale_bits;
   input [31:0] bits;
   input        scale_x2;
@@ -450,7 +259,7 @@ edge_actu_rcp_backend #(.ALIGN_LATENCY(NONLINEAR_LATENCY)) x_rcp_backend (
   .out_mode(aligned_mode),
   .out_payload_bf19(aligned_payload_bf19),
   .out_primary_bf22(aligned_primary_bf22),
-  .out_rcp_bits(nonlinear_out_bits),
+  .out_rcp_bf22(nonlinear_out_bf22),
   .out_sum_clear(backend_sum_clear)
 );
 
@@ -463,78 +272,21 @@ assign softmax_delta_bits = fp32_sub_bits(in_value, in_softmax_max);
 assign exp_input_bits = (in_mode == EDGE_ACTU_MODE_SOFTMAX) ? softmax_delta_bits :
                         (fused_tanh_like ? neg_abs_x2_bits :
                          (fused_sigmoid_like ? neg_abs_bits : in_value));
-assign aligned_payload_bits = {aligned_payload_bf19, 13'b0};
-assign aligned_primary_bits = {aligned_primary_bf22, 10'b0};
-assign aligned_rcp_internal_bits = bf22_round_bits(nonlinear_out_bits);
-assign sigmoid_bits = bf19_round_bits(fp32_mul_bits(
-                         bf19_round_bits(aligned_primary_bits),
-                         bf19_round_bits(aligned_rcp_internal_bits)));
-assign silu_product_bits = bf22_round_bits(fp32_mul_bits(
-                            {final_payload_q, 13'b0},
-                            bf19_round_bits(final_sigmoid_q)));
-assign tanh_signed_bits = final_payload_q[18] ? {1'b1, final_sigmoid_q[30:0]} :
-                          final_sigmoid_q;
-assign exp_result_bits = bf16_round_bits(aligned_primary_bits);
-assign rcp_result_bits = bf16_round_bits(nonlinear_out_bits);
-assign sigmoid_result_bits = bf16_round_bits(final_sigmoid_q);
-assign silu_result_bits = bf16_round_bits(silu_product_bits);
-assign tanh_result_bits = bf16_round_bits(tanh_signed_bits);
-assign softmax_result_bits = bf16_round_bits(aligned_primary_bits);
-assign softmax_product_bits = bf22_round_bits(fp32_mul_bits(
-                                  aligned_payload_bits,
-                                  bf19_round_bits(nonlinear_out_bits)));
-assign softmax_normalize_bits = bf16_round_bits(final_softmax_product_q);
-assign final_direct_bits = ((aligned_mode == EDGE_ACTU_MODE_EXP_ONLY) ||
-                            (aligned_mode == EDGE_ACTU_MODE_SOFTMAX)) ?
-                           exp_result_bits : rcp_result_bits;
-assign softmax_sum_next_bf22 = bf22_add_positive(softmax_sum_q,
-                                                 aligned_primary_bf22);
-assign softmax_sum_next_bits = {softmax_sum_next_bf22, 10'b0};
-assign softmax_sum_valid = nonlinear_out_valid &&
-                           (aligned_mode == EDGE_ACTU_MODE_SOFTMAX);
-assign softmax_sum_value = softmax_sum_next_bits;
-assign stage0_result_bits = (final_mode_q == EDGE_ACTU_MODE_SIGMOID) ?
-                            sigmoid_result_bits :
-                            ((final_mode_q == EDGE_ACTU_MODE_SILU) ? silu_result_bits :
-                             ((final_mode_q == EDGE_ACTU_MODE_TANH) ? tanh_result_bits :
-                              ((final_mode_q == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
-                               softmax_normalize_bits : final_direct_q)));
 
-always @(posedge forever_cpuclk or negedge cpurst_b) begin
-  if (!cpurst_b) begin
-    softmax_sum_q <= 22'b0;
-    final_mode_q <= 3'b0;
-    final_payload_q <= 19'b0;
-    final_sigmoid_q <= 32'b0;
-    final_direct_q <= 32'b0;
-    final_softmax_product_q <= 32'b0;
-    valid_pipe <= {POST_STAGES{1'b0}};
-    for (stage = 0; stage < POST_STAGES; stage = stage + 1) begin
-      mode_pipe[stage] <= 3'b0;
-      value_pipe[stage] <= 32'b0;
-    end
-  end else begin
-    if (backend_sum_clear)
-      softmax_sum_q <= 22'b0;
-    else if (softmax_sum_valid)
-      softmax_sum_q <= softmax_sum_next_bf22;
-    final_mode_q <= aligned_mode;
-    final_payload_q <= aligned_payload_bf19;
-    final_sigmoid_q <= sigmoid_bits;
-    final_direct_q <= final_direct_bits;
-    final_softmax_product_q <= softmax_product_bits;
-    valid_pipe[0] <= nonlinear_out_valid;
-    mode_pipe[0] <= aligned_mode;
-    value_pipe[0] <= stage0_result_bits;
-
-    for (stage = 1; stage < POST_STAGES; stage = stage + 1) begin
-      valid_pipe[stage] <= valid_pipe[stage - 1];
-      mode_pipe[stage] <= mode_pipe[stage - 1];
-    end
-    for (stage = 1; stage <= VALUE_PIPE_LAST; stage = stage + 1) begin
-      value_pipe[stage] <= value_pipe[stage - 1];
-    end
-  end
-end
+edge_actu_finalizer #(.POST_STAGES(POST_STAGES)) x_finalizer (
+  .clk(forever_cpuclk),
+  .cpurst_b(cpurst_b),
+  .in_valid(nonlinear_out_valid),
+  .in_mode(aligned_mode),
+  .in_payload_bf19(aligned_payload_bf19),
+  .in_primary_bf22(aligned_primary_bf22),
+  .in_rcp_bf22(nonlinear_out_bf22),
+  .in_sum_clear(backend_sum_clear),
+  .out_valid(finalizer_out_valid),
+  .out_mode(finalizer_out_mode),
+  .out_value(finalizer_out_value),
+  .softmax_sum_valid(finalizer_sum_valid),
+  .softmax_sum_value(finalizer_sum_value)
+);
 
 endmodule

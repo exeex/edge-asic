@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module edge_actu_bf16_stream #(
-  parameter PIPE_STAGES = 14
+  parameter PIPE_STAGES = 15
 ) (
   input wire clk,
   input wire cpurst_b,
