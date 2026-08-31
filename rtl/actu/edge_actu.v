@@ -196,6 +196,24 @@ function [31:0] bf22_round_bits;
   end
 endfunction
 
+// Shared fused-finalizer multiplier operands use BF19 (1/8/10).  Keeping the
+// truncation explicit lets synthesis reduce every significand multiplier to
+// the same 11x11 implementation while EXP/RCP forwarding remains BF22.
+function [31:0] bf19_round_bits;
+  input [31:0] bits;
+  reg [31:0] rounded_bits;
+  reg [31:0] bias;
+  begin
+    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
+      bf19_round_bits = 32'h7fc0_0000;
+    end else begin
+      bias = 32'h0000_0fff + {31'b0, bits[13]};
+      rounded_bits = (bits + bias) & 32'hffff_e000;
+      bf19_round_bits = rounded_bits;
+    end
+  end
+endfunction
+
 function [26:0] rshift_sticky27;
   input [26:0] value;
   input integer shift;
@@ -439,16 +457,19 @@ assign aligned_rcp_internal_bits = bf22_round_bits(nonlinear_out_bits);
 assign aligned_exp_bf22 = aligned_exp_internal_bits[31:10];
 assign rcp_lut_bits = nonlinear_out_bits;
 assign rcp_internal_bits = aligned_rcp_internal_bits;
-assign sigmoid_neg_bits = bf22_round_bits(fp32_mul_bits(aligned_exp_internal_bits,
-                                                            aligned_rcp_internal_bits));
+assign sigmoid_neg_bits = bf19_round_bits(fp32_mul_bits(
+                            bf19_round_bits(aligned_exp_internal_bits),
+                            bf19_round_bits(aligned_rcp_internal_bits)));
 assign sigmoid_bits = aligned_x_bits[31] ? sigmoid_neg_bits :
-                       aligned_rcp_internal_bits;
+                       bf19_round_bits(aligned_rcp_internal_bits);
 assign silu_product_bits = bf22_round_bits(fp32_mul_bits(
-                            bf22_round_bits(aligned_x_bits), sigmoid_bits));
+                            bf19_round_bits(aligned_x_bits),
+                            bf19_round_bits(sigmoid_bits)));
 assign tanh_one_minus_bits = bf22_round_bits(fp32_sub_bits(32'h3f80_0000,
                                                                aligned_exp_internal_bits));
-assign tanh_abs_bits = bf22_round_bits(fp32_mul_bits(tanh_one_minus_bits,
-                                                         aligned_rcp_internal_bits));
+assign tanh_abs_bits = bf22_round_bits(fp32_mul_bits(
+                         bf19_round_bits(tanh_one_minus_bits),
+                         bf19_round_bits(aligned_rcp_internal_bits)));
 assign tanh_signed_bits = aligned_x_bits[31] ? {1'b1, tanh_abs_bits[30:0]} :
                           tanh_abs_bits;
 assign exp_result_bits = bf16_round_bits(aligned_exp_bits);
@@ -458,7 +479,8 @@ assign silu_result_bits = bf16_round_bits(silu_product_bits);
 assign tanh_result_bits = bf16_round_bits(tanh_signed_bits);
 assign softmax_result_bits = bf16_round_bits(aligned_exp_bits);
 assign softmax_normalize_bits = bf16_round_bits(fp32_mul_bits(
-                                  aligned_x_bits, nonlinear_out_bits));
+                                  bf19_round_bits(aligned_x_bits),
+                                  bf19_round_bits(nonlinear_out_bits)));
 assign softmax_sum_next_bf22 = bf22_add_positive(softmax_sum_q,
                                                  aligned_exp_bf22);
 assign softmax_sum_next_bits = {softmax_sum_next_bf22, 10'b0};
