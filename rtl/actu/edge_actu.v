@@ -54,6 +54,7 @@ wire [31:0] silu_result_bits;
 wire [31:0] tanh_result_bits;
 wire [31:0] softmax_result_bits;
 wire [31:0] softmax_normalize_bits;
+wire [21:0] softmax_sum_next_bf22;
 wire [31:0] softmax_sum_next_bits;
 wire [31:0] stage0_result_bits;
 wire [31:0] neg_abs_bits;
@@ -75,7 +76,8 @@ wire [31:0] aligned_x_bits;
 wire [31:0] aligned_exp_bits;
 wire [31:0] aligned_exp_internal_bits;
 wire [31:0] aligned_rcp_internal_bits;
-reg  [31:0] softmax_sum_q;
+wire [21:0] aligned_exp_bf22;
+reg  [21:0] softmax_sum_q;
 
 assign in_ready = cpurst_b;
 assign input_fire = in_valid && in_ready;
@@ -95,6 +97,87 @@ function [31:0] bf16_round_bits;
         rounded = 16'h8000;
     end
     bf16_round_bits = {rounded, 16'h0000};
+  end
+endfunction
+
+// ACTU-local positive BF22 accumulator.  Softmax EXP values and their running
+// sum are finite and non-negative, so the recurrence does not need the generic
+// FP32 sign/subtract/cancellation path or a linear left-normalization loop.
+// BF22 is encoded natively as sign/exponent/fraction = 1/8/13 bits.
+function [21:0] bf22_add_positive;
+  input [21:0] a;
+  input [21:0] b;
+  reg [7:0] a_exp;
+  reg [7:0] b_exp;
+  reg [7:0] large_exp;
+  reg [7:0] small_exp;
+  reg [13:0] a_sig;
+  reg [13:0] b_sig;
+  reg [13:0] large_main;
+  reg [14:0] rounded_main;
+  reg [18:0] large_sig;
+  reg [18:0] small_sig;
+  reg [18:0] norm_sig;
+  reg [19:0] sum;
+  reg sticky;
+  integer shift;
+  begin
+    a_exp = a[20:13];
+    b_exp = b[20:13];
+    a_sig = (a_exp == 0) ? {1'b0, a[12:0]} : {1'b1, a[12:0]};
+    b_sig = (b_exp == 0) ? {1'b0, b[12:0]} : {1'b1, b[12:0]};
+    if (a_sig == 0) begin
+      bf22_add_positive = b;
+    end else if (b_sig == 0) begin
+      bf22_add_positive = a;
+    end else begin
+      if ((b_exp > a_exp) || ((b_exp == a_exp) && (b_sig > a_sig))) begin
+        large_exp = (b_exp == 0) ? 8'd1 : b_exp;
+        small_exp = (a_exp == 0) ? 8'd1 : a_exp;
+        large_sig = {b_sig, 5'b0};
+        shift = {24'b0, large_exp} - {24'b0, small_exp};
+        if (shift >= 19)
+          small_sig = {18'b0, |a_sig};
+        else if (shift == 0)
+          small_sig = {a_sig, 5'b0};
+        else begin
+          sticky = |({a_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
+          small_sig = ({a_sig, 5'b0} >> shift) | {18'b0, sticky};
+        end
+      end else begin
+        large_exp = (a_exp == 0) ? 8'd1 : a_exp;
+        small_exp = (b_exp == 0) ? 8'd1 : b_exp;
+        large_sig = {a_sig, 5'b0};
+        shift = {24'b0, large_exp} - {24'b0, small_exp};
+        if (shift >= 19)
+          small_sig = {18'b0, |b_sig};
+        else if (shift == 0)
+          small_sig = {b_sig, 5'b0};
+        else begin
+          sticky = |({b_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
+          small_sig = ({b_sig, 5'b0} >> shift) | {18'b0, sticky};
+        end
+      end
+      sum = {1'b0, large_sig} + {1'b0, small_sig};
+      if (sum[19]) begin
+        norm_sig = {sum[19:2], |sum[1:0]};
+        large_exp = large_exp + 1'b1;
+      end else begin
+        norm_sig = sum[18:0];
+      end
+      large_main = norm_sig[18:5];
+      rounded_main = {1'b0, large_main} +
+                     (norm_sig[4] && (|norm_sig[3:0] || large_main[0]));
+      if ((large_exp == 8'hff) ||
+          ((large_exp == 8'hfe) && rounded_main[14])) begin
+        bf22_add_positive = {1'b0, 8'hfe, 13'h1fff};
+      end else if (rounded_main[14]) begin
+        bf22_add_positive = {1'b0, large_exp + 1'b1,
+                             rounded_main[13:1]};
+      end else begin
+        bf22_add_positive = {1'b0, large_exp, rounded_main[12:0]};
+      end
+    end
   end
 endfunction
 
@@ -353,6 +436,7 @@ assign aligned_x_bits = nonlinear_x_pipe[NONLINEAR_LATENCY-1];
 assign aligned_exp_bits = nonlinear_exp_pipe[NONLINEAR_LATENCY-1];
 assign aligned_exp_internal_bits = bf22_round_bits(aligned_exp_bits);
 assign aligned_rcp_internal_bits = bf22_round_bits(nonlinear_out_bits);
+assign aligned_exp_bf22 = aligned_exp_internal_bits[31:10];
 assign rcp_lut_bits = nonlinear_out_bits;
 assign rcp_internal_bits = aligned_rcp_internal_bits;
 assign sigmoid_neg_bits = bf22_round_bits(fp32_mul_bits(aligned_exp_internal_bits,
@@ -375,8 +459,9 @@ assign tanh_result_bits = bf16_round_bits(tanh_signed_bits);
 assign softmax_result_bits = bf16_round_bits(aligned_exp_bits);
 assign softmax_normalize_bits = bf16_round_bits(fp32_mul_bits(
                                   aligned_x_bits, nonlinear_out_bits));
-assign softmax_sum_next_bits = fp32_add_bits(softmax_sum_q,
-                                             aligned_exp_internal_bits);
+assign softmax_sum_next_bf22 = bf22_add_positive(softmax_sum_q,
+                                                 aligned_exp_bf22);
+assign softmax_sum_next_bits = {softmax_sum_next_bf22, 10'b0};
 assign softmax_sum_valid = nonlinear_out_valid &&
                            (aligned_mode == EDGE_ACTU_MODE_SOFTMAX);
 assign softmax_sum_value = softmax_sum_next_bits;
@@ -392,7 +477,7 @@ assign stage0_result_bits = (aligned_mode == EDGE_ACTU_MODE_EXP_ONLY) ? exp_resu
 
 always @(posedge forever_cpuclk or negedge cpurst_b) begin
   if (!cpurst_b) begin
-    softmax_sum_q <= 32'b0;
+    softmax_sum_q <= 22'b0;
     valid_pipe <= {POST_STAGES{1'b0}};
     for (stage = 0; stage < POST_STAGES; stage = stage + 1) begin
       mode_pipe[stage] <= 3'b0;
@@ -405,9 +490,9 @@ always @(posedge forever_cpuclk or negedge cpurst_b) begin
     end
   end else begin
     if (softmax_sum_clear)
-      softmax_sum_q <= 32'b0;
+      softmax_sum_q <= 22'b0;
     else if (softmax_sum_valid)
-      softmax_sum_q <= softmax_sum_next_bits;
+      softmax_sum_q <= softmax_sum_next_bf22;
     nonlinear_mode_pipe[0] <= in_mode;
     nonlinear_x_pipe[0] <= in_value;
     nonlinear_exp_pipe[0] <= exp_lut_bits;
