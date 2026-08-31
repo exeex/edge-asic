@@ -47,7 +47,6 @@ reg [17:0]  rcp_result_s3;
 reg [17:0]  rsqrt_corr_s3;
 reg [17:0]  result_s4;
 
-wire [6:0]  fraction_bf16;
 wire [4:0]  mant_idx;
 wire signed [9:0] unbiased_exp;
 wire        exponent_odd;
@@ -78,8 +77,7 @@ wire signed [10:0]   result_exp;
 wire signed [11:0]   biased_exp;
 wire [22:0]          result_fraction;
 
-assign fraction_bf16 = in_value[22:16];
-assign mant_idx = fraction_bf16[6:2];
+assign mant_idx = in_value[22:18];
 assign unbiased_exp = {2'b0, in_value[30:23]} - 10'sd127;
 assign exponent_odd = unbiased_exp[0];
 assign mant_q16 = {1'b0, 1'b1, in_value[22:7]};

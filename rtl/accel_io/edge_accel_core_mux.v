@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module edge_accel_core_mux #(
-  parameter ACTU_LATENCY = 9
+  parameter ACTU_LATENCY = 14
 ) (
   input wire clk,
   input wire cpurst_b,

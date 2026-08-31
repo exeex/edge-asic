@@ -6,13 +6,12 @@ module edge_actu_exp2_split_core (
   output wire [31:0]       value_bits
 );
 
-wire [14:0] mant_q14;
 wire [28:0] mant_product_q28;
 
 edge_actu_exp2_split_mant_q14 x_mant (
   .frac_code(frac_code),
   .mant_product_q28(mant_product_q28),
-  .mant_q14(mant_q14)
+  .mant_q14()
 );
 
 edge_actu_exp2_pack_q28_fp32 x_pack (

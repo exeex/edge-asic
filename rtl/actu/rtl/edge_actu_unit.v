@@ -3,7 +3,7 @@
 // Legacy ACTU-only command facade around the production shared accelerator unit.
 module edge_actu_unit #(
   parameter ADDR_WIDTH = 16,
-  parameter ACTU_PIPE_STAGES = 9,
+  parameter ACTU_PIPE_STAGES = 14,
   parameter OUT_FIFO_DEPTH = 16,
   parameter OUT_FIFO_INDEX_WIDTH = 4
 ) (
