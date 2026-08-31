@@ -28,8 +28,9 @@ localparam [2:0] EDGE_ACTU_MODE_TANH     = 3'd4;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX  = 3'd5;
 localparam [2:0] EDGE_ACTU_MODE_RSQRT    = 3'd6;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX_NORMALIZE = 3'd7;
-localparam integer NONLINEAR_LATENCY = 4;
+localparam integer NONLINEAR_LATENCY = 5;
 localparam integer POST_STAGES = PIPE_STAGES - NONLINEAR_LATENCY;
+localparam integer VALUE_PIPE_LAST = POST_STAGES - 2;
 
 reg [POST_STAGES-1:0] valid_pipe;
 reg [2:0]             mode_pipe [0:POST_STAGES-1];
@@ -37,6 +38,13 @@ reg [31:0]            value_pipe [0:POST_STAGES-1];
 reg [2:0]             nonlinear_mode_pipe [0:NONLINEAR_LATENCY-1];
 reg [31:0]            nonlinear_x_pipe [0:NONLINEAR_LATENCY-1];
 reg [31:0]            nonlinear_exp_pipe [0:NONLINEAR_LATENCY-1];
+reg [2:0]             final_mode_q;
+reg [31:0]            final_x_q;
+reg [31:0]            final_rcp_q;
+reg [31:0]            final_sigmoid_q;
+reg [31:0]            final_tanh_num_q;
+reg [31:0]            final_direct_q;
+reg [31:0]            final_softmax_product_q;
 
 integer stage;
 wire   input_fire;
@@ -54,6 +62,8 @@ wire [31:0] silu_result_bits;
 wire [31:0] tanh_result_bits;
 wire [31:0] softmax_result_bits;
 wire [31:0] softmax_normalize_bits;
+wire [31:0] softmax_product_bits;
+wire [31:0] final_direct_bits;
 wire [21:0] softmax_sum_next_bf22;
 wire [31:0] softmax_sum_next_bits;
 wire [31:0] stage0_result_bits;
@@ -83,7 +93,7 @@ assign in_ready = cpurst_b;
 assign input_fire = in_valid && in_ready;
 assign out_valid = valid_pipe[POST_STAGES-1];
 assign out_mode = mode_pipe[POST_STAGES-1];
-assign out_value = value_pipe[POST_STAGES-1];
+assign out_value = value_pipe[VALUE_PIPE_LAST];
 
 function [31:0] bf16_round_bits;
   input [31:0] bits;
@@ -463,43 +473,51 @@ assign sigmoid_neg_bits = bf19_round_bits(fp32_mul_bits(
 assign sigmoid_bits = aligned_x_bits[31] ? sigmoid_neg_bits :
                        bf19_round_bits(aligned_rcp_internal_bits);
 assign silu_product_bits = bf22_round_bits(fp32_mul_bits(
-                            bf19_round_bits(aligned_x_bits),
-                            bf19_round_bits(sigmoid_bits)));
+                            bf19_round_bits(final_x_q),
+                            bf19_round_bits(final_sigmoid_q)));
 assign tanh_one_minus_bits = bf22_round_bits(fp32_sub_bits(32'h3f80_0000,
                                                                aligned_exp_internal_bits));
 assign tanh_abs_bits = bf22_round_bits(fp32_mul_bits(
-                         bf19_round_bits(tanh_one_minus_bits),
-                         bf19_round_bits(aligned_rcp_internal_bits)));
-assign tanh_signed_bits = aligned_x_bits[31] ? {1'b1, tanh_abs_bits[30:0]} :
+                         bf19_round_bits(final_tanh_num_q),
+                         bf19_round_bits(final_rcp_q)));
+assign tanh_signed_bits = final_x_q[31] ? {1'b1, tanh_abs_bits[30:0]} :
                           tanh_abs_bits;
 assign exp_result_bits = bf16_round_bits(aligned_exp_bits);
 assign rcp_result_bits = bf16_round_bits(nonlinear_out_bits);
-assign sigmoid_result_bits = bf16_round_bits(sigmoid_bits);
+assign sigmoid_result_bits = bf16_round_bits(final_sigmoid_q);
 assign silu_result_bits = bf16_round_bits(silu_product_bits);
 assign tanh_result_bits = bf16_round_bits(tanh_signed_bits);
 assign softmax_result_bits = bf16_round_bits(aligned_exp_bits);
-assign softmax_normalize_bits = bf16_round_bits(fp32_mul_bits(
+assign softmax_product_bits = bf22_round_bits(fp32_mul_bits(
                                   bf19_round_bits(aligned_x_bits),
                                   bf19_round_bits(nonlinear_out_bits)));
+assign softmax_normalize_bits = bf16_round_bits(final_softmax_product_q);
+assign final_direct_bits = ((aligned_mode == EDGE_ACTU_MODE_EXP_ONLY) ||
+                            (aligned_mode == EDGE_ACTU_MODE_SOFTMAX)) ?
+                           exp_result_bits : rcp_result_bits;
 assign softmax_sum_next_bf22 = bf22_add_positive(softmax_sum_q,
                                                  aligned_exp_bf22);
 assign softmax_sum_next_bits = {softmax_sum_next_bf22, 10'b0};
 assign softmax_sum_valid = nonlinear_out_valid &&
                            (aligned_mode == EDGE_ACTU_MODE_SOFTMAX);
 assign softmax_sum_value = softmax_sum_next_bits;
-assign stage0_result_bits = (aligned_mode == EDGE_ACTU_MODE_EXP_ONLY) ? exp_result_bits :
-                            ((aligned_mode == EDGE_ACTU_MODE_RCP_ONLY) ? rcp_result_bits :
-                             ((aligned_mode == EDGE_ACTU_MODE_SIGMOID) ? sigmoid_result_bits :
-                              ((aligned_mode == EDGE_ACTU_MODE_SILU) ? silu_result_bits :
-                               ((aligned_mode == EDGE_ACTU_MODE_TANH) ? tanh_result_bits :
-                                ((aligned_mode == EDGE_ACTU_MODE_SOFTMAX) ? softmax_result_bits :
-                                 ((aligned_mode == EDGE_ACTU_MODE_RSQRT) ? rcp_result_bits :
-                                  ((aligned_mode == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
-                                   softmax_normalize_bits : 32'b0)))))));
+assign stage0_result_bits = (final_mode_q == EDGE_ACTU_MODE_SIGMOID) ?
+                            sigmoid_result_bits :
+                            ((final_mode_q == EDGE_ACTU_MODE_SILU) ? silu_result_bits :
+                             ((final_mode_q == EDGE_ACTU_MODE_TANH) ? tanh_result_bits :
+                              ((final_mode_q == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
+                               softmax_normalize_bits : final_direct_q)));
 
 always @(posedge forever_cpuclk or negedge cpurst_b) begin
   if (!cpurst_b) begin
     softmax_sum_q <= 22'b0;
+    final_mode_q <= 3'b0;
+    final_x_q <= 32'b0;
+    final_rcp_q <= 32'b0;
+    final_sigmoid_q <= 32'b0;
+    final_tanh_num_q <= 32'b0;
+    final_direct_q <= 32'b0;
+    final_softmax_product_q <= 32'b0;
     valid_pipe <= {POST_STAGES{1'b0}};
     for (stage = 0; stage < POST_STAGES; stage = stage + 1) begin
       mode_pipe[stage] <= 3'b0;
@@ -515,6 +533,13 @@ always @(posedge forever_cpuclk or negedge cpurst_b) begin
       softmax_sum_q <= 22'b0;
     else if (softmax_sum_valid)
       softmax_sum_q <= softmax_sum_next_bf22;
+    final_mode_q <= aligned_mode;
+    final_x_q <= aligned_x_bits;
+    final_rcp_q <= aligned_rcp_internal_bits;
+    final_sigmoid_q <= sigmoid_bits;
+    final_tanh_num_q <= tanh_one_minus_bits;
+    final_direct_q <= final_direct_bits;
+    final_softmax_product_q <= softmax_product_bits;
     nonlinear_mode_pipe[0] <= in_mode;
     nonlinear_x_pipe[0] <= in_value;
     nonlinear_exp_pipe[0] <= exp_lut_bits;
@@ -531,6 +556,8 @@ always @(posedge forever_cpuclk or negedge cpurst_b) begin
     for (stage = 1; stage < POST_STAGES; stage = stage + 1) begin
       valid_pipe[stage] <= valid_pipe[stage - 1];
       mode_pipe[stage] <= mode_pipe[stage - 1];
+    end
+    for (stage = 1; stage <= VALUE_PIPE_LAST; stage = stage + 1) begin
       value_pipe[stage] <= value_pipe[stage - 1];
     end
   end
