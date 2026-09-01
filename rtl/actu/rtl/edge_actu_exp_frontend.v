@@ -7,12 +7,14 @@ module edge_actu_exp_frontend (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
+  input  wire        in_last,
   input  wire [2:0]  in_mode,
   input  wire [31:0] in_value,
   input  wire [31:0] in_scalar,
   input  wire        in_sum_clear,
   input  wire [31:0] exp_input_bits,
   output reg         out_valid,
+  output reg         out_last,
   output reg  [2:0]  out_mode,
   output reg  [18:0] out_payload_bf19,
   output reg         out_sum_clear,
@@ -41,6 +43,7 @@ wire [21:0] bypass_add_bf22_s2;
 wire fused_sigmoid_s3;
 
 reg         valid_s0;
+reg         last_s0;
 reg [2:0]   mode_s0;
 reg [18:0]  payload_bf19_s0;
 reg         sum_clear_s0;
@@ -49,6 +52,7 @@ reg [21:0]  value_bf22_s0;
 reg [21:0]  scalar_bf22_s0;
 
 reg         valid_s1;
+reg         last_s1;
 reg [2:0]   mode_s1;
 reg [18:0]  payload_bf19_s1;
 reg         sum_clear_s1;
@@ -61,6 +65,7 @@ reg [7:0]   bypass_add_exp_s1_q;
 reg [19:0]  bypass_add_raw_s1_q;
 
 reg         valid_s2;
+reg         last_s2;
 reg [2:0]   mode_s2;
 reg [18:0]  payload_bf19_s2;
 reg         sum_clear_s2;
@@ -319,6 +324,7 @@ assign fused_sigmoid_s3 = (mode_s2 == EDGE_ACTU_MODE_SIGMOID) ||
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
     valid_s0 <= 1'b0;
+    last_s0 <= 1'b0;
     mode_s0 <= 3'b0;
     payload_bf19_s0 <= 19'b0;
     sum_clear_s0 <= 1'b0;
@@ -326,6 +332,7 @@ always @(posedge clk or negedge cpurst_b) begin
     value_bf22_s0 <= 22'b0;
     scalar_bf22_s0 <= 22'b0;
     valid_s1 <= 1'b0;
+    last_s1 <= 1'b0;
     mode_s1 <= 3'b0;
     payload_bf19_s1 <= 19'b0;
     sum_clear_s1 <= 1'b0;
@@ -337,6 +344,7 @@ always @(posedge clk or negedge cpurst_b) begin
     bypass_add_exp_s1_q <= 8'b0;
     bypass_add_raw_s1_q <= 20'b0;
     valid_s2 <= 1'b0;
+    last_s2 <= 1'b0;
     mode_s2 <= 3'b0;
     payload_bf19_s2 <= 19'b0;
     sum_clear_s2 <= 1'b0;
@@ -348,6 +356,7 @@ always @(posedge clk or negedge cpurst_b) begin
     tanh_num_raw_s2 <= 19'b0;
     tanh_num_lzc_s2_q <= 5'b0;
     out_valid <= 1'b0;
+    out_last <= 1'b0;
     out_mode <= 3'b0;
     out_payload_bf19 <= 19'b0;
     out_sum_clear <= 1'b0;
@@ -356,6 +365,7 @@ always @(posedge clk or negedge cpurst_b) begin
   end else begin
     // F0: EXP output boundary.
     valid_s0 <= in_valid;
+    last_s0 <= in_last;
     mode_s0 <= in_mode;
     payload_bf19_s0 <= bf19_round_native(in_value);
     sum_clear_s0 <= in_sum_clear;
@@ -365,6 +375,7 @@ always @(posedge clk or negedge cpurst_b) begin
 
     // F1: shared alignment and parallel 1+e / 1-e raw arithmetic.
     valid_s1 <= valid_s0;
+    last_s1 <= last_s0;
     mode_s1 <= mode_s0;
     payload_bf19_s1 <= payload_bf19_s0;
     sum_clear_s1 <= sum_clear_s0;
@@ -378,6 +389,7 @@ always @(posedge clk or negedge cpurst_b) begin
 
     // F2: denominator pack and numerator leading-zero detection.
     valid_s2 <= valid_s1;
+    last_s2 <= last_s1;
     mode_s2 <= mode_s1;
     payload_bf19_s2 <= payload_bf19_s1;
     sum_clear_s2 <= sum_clear_s1;
@@ -391,6 +403,7 @@ always @(posedge clk or negedge cpurst_b) begin
 
     // F3: numerator normalize/pack and native-BF22 frontend packet.
     out_valid <= valid_s2;
+    out_last <= last_s2;
     out_mode <= mode_s2;
     out_payload_bf19 <= payload_bf19_s2;
     out_sum_clear <= sum_clear_s2;

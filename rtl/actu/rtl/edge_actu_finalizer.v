@@ -5,11 +5,12 @@
 // selection, softmax accumulation, and output pipeline state.
 (* keep_hierarchy = "yes" *)
 module edge_actu_finalizer #(
-  parameter POST_STAGES = 4
+  parameter POST_STAGES = 6
 ) (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
+  input  wire        in_last,
   input  wire [2:0]  in_mode,
   input  wire [18:0] in_payload_bf19,
   input  wire [21:0] in_primary_bf22,
@@ -19,6 +20,7 @@ module edge_actu_finalizer #(
   output wire [2:0]  out_mode,
   output wire [31:0] out_value,
   output wire        softmax_sum_valid,
+  output wire        softmax_sum_done,
   output wire [31:0] softmax_sum_value
 );
 
@@ -28,13 +30,30 @@ localparam [2:0] EDGE_ACTU_MODE_SILU     = 3'd3;
 localparam [2:0] EDGE_ACTU_MODE_TANH     = 3'd4;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX  = 3'd5;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX_NORMALIZE = 3'd7;
-localparam integer OUTPUT_PIPE_LAST = POST_STAGES - 4;
+localparam integer OUTPUT_PIPE_LAST = POST_STAGES - 6;
 
 reg [POST_STAGES-1:0] valid_pipe;
 reg [2:0]             mode_pipe [0:POST_STAGES-1];
 reg [31:0]            value_pipe [0:OUTPUT_PIPE_LAST];
 
-// M1: registered raw BF22 numerator/reciprocal product.
+// P0: pure backend/finalizer boundary relay.  No arithmetic is allowed on
+// this edge; M1 consumes only these registered fields.
+reg               relay_valid_q;
+reg [2:0]         relay_mode_q;
+reg [18:0]        relay_payload_bf19_q;
+reg [21:0]        relay_primary_bf22_q;
+reg [21:0]        relay_rcp_bf22_q;
+
+// M1P: metadata aligned with the registered pair of 14x7 partial products.
+reg [2:0]         mul1_partial_mode_q;
+reg [18:0]        mul1_partial_payload_q;
+reg [21:0]        mul1_partial_direct_q;
+reg               mul1_partial_sign_q;
+reg               mul1_partial_zero_q;
+reg               mul1_partial_special_q;
+reg signed [11:0] mul1_partial_exp_q;
+
+// M1A: registered raw BF22 numerator/reciprocal product after partial add.
 reg [2:0]         mul1_mode_q;
 reg [18:0]        mul1_payload_q;
 reg [21:0]        mul1_direct_q;
@@ -50,7 +69,15 @@ reg [18:0] mul2_payload_q;
 reg [21:0] mul2_direct_q;
 reg [21:0] mul2_product_bf22_q;
 
-// M3: SiLU's second raw BF22 product or a mode-aligned bypass result.
+// M3P: metadata/bypass aligned with SiLU's second 14x7 partial pair.
+reg [2:0]         mul3_partial_mode_q;
+reg [21:0]        mul3_partial_bypass_bf22_q;
+reg               mul3_partial_sign_q;
+reg               mul3_partial_zero_q;
+reg               mul3_partial_special_q;
+reg signed [11:0] mul3_partial_exp_q;
+
+// M3A: SiLU's second raw BF22 product or a mode-aligned bypass result.
 reg [2:0]         final_mode_q;
 reg [21:0]        final_bypass_bf22_q;
 reg               mul3_sign_q;
@@ -59,7 +86,6 @@ reg               mul3_special_q;
 reg signed [11:0] mul3_exp_q;
 reg [27:0]        mul3_product_q;
 
-reg [21:0] softmax_sum_q;
 integer stage;
 
 wire [21:0] mul1_lhs_bf22;
@@ -85,7 +111,7 @@ wire [21:0] mul3_product_bf22;
 wire [21:0] stage3_bypass_bf22;
 wire [21:0] final_result_bf22;
 wire [31:0] final_result_bits;
-wire [21:0] softmax_sum_next_bf22;
+wire [21:0] softmax_sum_bf22;
 
 assign out_valid = valid_pipe[POST_STAGES-1];
 assign out_mode = mode_pipe[POST_STAGES-1];
@@ -104,83 +130,6 @@ function [31:0] bf16_round_bits;
         rounded = 16'h8000;
     end
     bf16_round_bits = {rounded, 16'h0000};
-  end
-endfunction
-
-function [21:0] bf22_add_positive;
-  input [21:0] a;
-  input [21:0] b;
-  reg [7:0] a_exp;
-  reg [7:0] b_exp;
-  reg [7:0] large_exp;
-  reg [7:0] small_exp;
-  reg [13:0] a_sig;
-  reg [13:0] b_sig;
-  reg [13:0] large_main;
-  reg [14:0] rounded_main;
-  reg [18:0] large_sig;
-  reg [18:0] small_sig;
-  reg [18:0] norm_sig;
-  reg [19:0] sum;
-  reg sticky;
-  integer shift;
-  begin
-    a_exp = a[20:13];
-    b_exp = b[20:13];
-    a_sig = (a_exp == 0) ? {1'b0, a[12:0]} : {1'b1, a[12:0]};
-    b_sig = (b_exp == 0) ? {1'b0, b[12:0]} : {1'b1, b[12:0]};
-    if (a_sig == 0) begin
-      bf22_add_positive = b;
-    end else if (b_sig == 0) begin
-      bf22_add_positive = a;
-    end else begin
-      if ((b_exp > a_exp) || ((b_exp == a_exp) && (b_sig > a_sig))) begin
-        large_exp = (b_exp == 0) ? 8'd1 : b_exp;
-        small_exp = (a_exp == 0) ? 8'd1 : a_exp;
-        large_sig = {b_sig, 5'b0};
-        shift = {24'b0, large_exp} - {24'b0, small_exp};
-        if (shift >= 19)
-          small_sig = {18'b0, |a_sig};
-        else if (shift == 0)
-          small_sig = {a_sig, 5'b0};
-        else begin
-          sticky = |({a_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
-          small_sig = ({a_sig, 5'b0} >> shift) | {18'b0, sticky};
-        end
-      end else begin
-        large_exp = (a_exp == 0) ? 8'd1 : a_exp;
-        small_exp = (b_exp == 0) ? 8'd1 : b_exp;
-        large_sig = {a_sig, 5'b0};
-        shift = {24'b0, large_exp} - {24'b0, small_exp};
-        if (shift >= 19)
-          small_sig = {18'b0, |b_sig};
-        else if (shift == 0)
-          small_sig = {b_sig, 5'b0};
-        else begin
-          sticky = |({b_sig, 5'b0} & ((19'b1 << shift) - 19'b1));
-          small_sig = ({b_sig, 5'b0} >> shift) | {18'b0, sticky};
-        end
-      end
-      sum = {1'b0, large_sig} + {1'b0, small_sig};
-      if (sum[19]) begin
-        norm_sig = {sum[19:2], |sum[1:0]};
-        large_exp = large_exp + 1'b1;
-      end else begin
-        norm_sig = sum[18:0];
-      end
-      large_main = norm_sig[18:5];
-      rounded_main = {1'b0, large_main} +
-                     (norm_sig[4] && (|norm_sig[3:0] || large_main[0]));
-      if ((large_exp == 8'hff) ||
-          ((large_exp == 8'hfe) && rounded_main[14])) begin
-        bf22_add_positive = {1'b0, 8'hfe, 13'h1fff};
-      end else if (rounded_main[14]) begin
-        bf22_add_positive = {1'b0, large_exp + 1'b1,
-                             rounded_main[13:1]};
-      end else begin
-        bf22_add_positive = {1'b0, large_exp, rounded_main[12:0]};
-      end
-    end
   end
 endfunction
 
@@ -234,28 +183,37 @@ endfunction
 
 // The first multiply consumes BF22 directly.  SOFTMAX_NORMALIZE selects the
 // BF19 payload extended exactly into BF22; no operand-side rounding exists.
-assign mul1_lhs_bf22 = (in_mode == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
-                       {in_payload_bf19, 3'b0} : in_primary_bf22;
-assign direct_bf22 = ((in_mode == EDGE_ACTU_MODE_EXP_ONLY) ||
-                      (in_mode == EDGE_ACTU_MODE_SOFTMAX)) ?
-                     in_primary_bf22 : in_rcp_bf22;
+assign mul1_lhs_bf22 =
+    (relay_mode_q == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
+    {relay_payload_bf19_q, 3'b0} : relay_primary_bf22_q;
+assign direct_bf22 = ((relay_mode_q == EDGE_ACTU_MODE_EXP_ONLY) ||
+                      (relay_mode_q == EDGE_ACTU_MODE_SOFTMAX)) ?
+                     relay_primary_bf22_q : relay_rcp_bf22_q;
 assign mul1_sig_a = (mul1_lhs_bf22[20:13] == 8'b0) ?
                     {1'b0, mul1_lhs_bf22[12:0]} :
                     {1'b1, mul1_lhs_bf22[12:0]};
-assign mul1_sig_b = (in_rcp_bf22[20:13] == 8'b0) ?
-                    {1'b0, in_rcp_bf22[12:0]} :
-                    {1'b1, in_rcp_bf22[12:0]};
-assign mul1_sign = mul1_lhs_bf22[21] ^ in_rcp_bf22[21];
+assign mul1_sig_b = (relay_rcp_bf22_q[20:13] == 8'b0) ?
+                    {1'b0, relay_rcp_bf22_q[12:0]} :
+                    {1'b1, relay_rcp_bf22_q[12:0]};
+assign mul1_sign = mul1_lhs_bf22[21] ^ relay_rcp_bf22_q[21];
 assign mul1_zero = (mul1_lhs_bf22[20:0] == 21'b0) ||
-                   (in_rcp_bf22[20:0] == 21'b0);
+                   (relay_rcp_bf22_q[20:0] == 21'b0);
 assign mul1_special = (mul1_lhs_bf22[20:13] == 8'hff) ||
-                      (in_rcp_bf22[20:13] == 8'hff);
+                      (relay_rcp_bf22_q[20:13] == 8'hff);
 assign mul1_exp =
     ((mul1_lhs_bf22[20:13] == 8'b0) ? -12'sd126 :
      ({4'b0, mul1_lhs_bf22[20:13]} - 12'sd127)) +
-    ((in_rcp_bf22[20:13] == 8'b0) ? -12'sd126 :
-     ({4'b0, in_rcp_bf22[20:13]} - 12'sd127));
-assign mul1_product = mul1_sig_a * mul1_sig_b;
+    ((relay_rcp_bf22_q[20:13] == 8'b0) ? -12'sd126 :
+     ({4'b0, relay_rcp_bf22_q[20:13]} - 12'sd127));
+// Preserve M1 as a physical leaf so full-ACTU APR can cluster this multiplier
+// independently without changing its combinational boundary or product stage.
+edge_actu_mul14_comb x_mul1 (
+  .clk(clk),
+  .cpurst_b(cpurst_b),
+  .lhs_sig_i(mul1_sig_a),
+  .rhs_sig_i(mul1_sig_b),
+  .product_o(mul1_product)
+);
 assign mul1_product_bf22 = bf22_pack_product(
     mul1_sign_q, mul1_zero_q, mul1_special_q, mul1_exp_q, mul1_product_q);
 
@@ -279,7 +237,13 @@ assign mul3_exp =
      ({4'b0, mul3_lhs_bf22[20:13]} - 12'sd127)) +
     ((mul2_product_bf22_q[20:13] == 8'b0) ? -12'sd126 :
      ({4'b0, mul2_product_bf22_q[20:13]} - 12'sd127));
-assign mul3_product = mul3_sig_a * mul3_sig_b;
+edge_actu_mul14_comb x_mul3 (
+  .clk(clk),
+  .cpurst_b(cpurst_b),
+  .lhs_sig_i(mul3_sig_a),
+  .rhs_sig_i(mul3_sig_b),
+  .product_o(mul3_product)
+);
 assign mul3_product_bf22 = bf22_pack_product(
     mul3_sign_q, mul3_zero_q, mul3_special_q, mul3_exp_q, mul3_product_q);
 
@@ -293,14 +257,33 @@ assign final_result_bf22 = (final_mode_q == EDGE_ACTU_MODE_SILU) ?
                            mul3_product_bf22 : final_bypass_bf22_q;
 assign final_result_bits = bf16_round_bits({final_result_bf22, 10'b0});
 
-assign softmax_sum_next_bf22 = bf22_add_positive(softmax_sum_q,
-                                                 in_primary_bf22);
-assign softmax_sum_valid = in_valid && (in_mode == EDGE_ACTU_MODE_SOFTMAX);
-assign softmax_sum_value = {softmax_sum_next_bf22, 10'b0};
+edge_actu_softmax_rsum x_softmax_rsum (
+  .clk(clk),
+  .cpurst_b(cpurst_b),
+  .clear_i(in_sum_clear),
+  .in_valid_i(in_valid && (in_mode == EDGE_ACTU_MODE_SOFTMAX)),
+  .in_last_i(in_last),
+  .in_bf22_i(in_primary_bf22),
+  .out_valid_o(softmax_sum_valid),
+  .out_done_o(softmax_sum_done),
+  .out_sum_bf22_o(softmax_sum_bf22)
+);
+assign softmax_sum_value = {softmax_sum_bf22, 10'b0};
 
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
-    softmax_sum_q <= 22'b0;
+    relay_valid_q <= 1'b0;
+    relay_mode_q <= 3'b0;
+    relay_payload_bf19_q <= 19'b0;
+    relay_primary_bf22_q <= 22'b0;
+    relay_rcp_bf22_q <= 22'b0;
+    mul1_partial_mode_q <= 3'b0;
+    mul1_partial_payload_q <= 19'b0;
+    mul1_partial_direct_q <= 22'b0;
+    mul1_partial_sign_q <= 1'b0;
+    mul1_partial_zero_q <= 1'b0;
+    mul1_partial_special_q <= 1'b0;
+    mul1_partial_exp_q <= 12'sd0;
     mul1_mode_q <= 3'b0;
     mul1_payload_q <= 19'b0;
     mul1_direct_q <= 22'b0;
@@ -313,6 +296,12 @@ always @(posedge clk or negedge cpurst_b) begin
     mul2_payload_q <= 19'b0;
     mul2_direct_q <= 22'b0;
     mul2_product_bf22_q <= 22'b0;
+    mul3_partial_mode_q <= 3'b0;
+    mul3_partial_bypass_bf22_q <= 22'b0;
+    mul3_partial_sign_q <= 1'b0;
+    mul3_partial_zero_q <= 1'b0;
+    mul3_partial_special_q <= 1'b0;
+    mul3_partial_exp_q <= 12'sd0;
     final_mode_q <= 3'b0;
     final_bypass_bf22_q <= 22'b0;
     mul3_sign_q <= 1'b0;
@@ -326,19 +315,30 @@ always @(posedge clk or negedge cpurst_b) begin
     for (stage = 0; stage <= OUTPUT_PIPE_LAST; stage = stage + 1)
       value_pipe[stage] <= 32'b0;
   end else begin
-    if (in_sum_clear)
-      softmax_sum_q <= 22'b0;
-    else if (softmax_sum_valid)
-      softmax_sum_q <= softmax_sum_next_bf22;
+    // P0: pure packet relay at the backend/finalizer boundary.
+    relay_valid_q <= in_valid;
+    relay_mode_q <= in_mode;
+    relay_payload_bf19_q <= in_payload_bf19;
+    relay_primary_bf22_q <= in_primary_bf22;
+    relay_rcp_bf22_q <= in_rcp_bf22;
 
-    // M1: pure registered-input 14x14 multiply.
-    mul1_mode_q <= in_mode;
-    mul1_payload_q <= in_payload_bf19;
-    mul1_direct_q <= direct_bf22;
-    mul1_sign_q <= mul1_sign;
-    mul1_zero_q <= mul1_zero;
-    mul1_special_q <= mul1_special;
-    mul1_exp_q <= mul1_exp;
+    // M1P: each multiplier leaf registers two 14x7 partial products.
+    mul1_partial_mode_q <= relay_mode_q;
+    mul1_partial_payload_q <= relay_payload_bf19_q;
+    mul1_partial_direct_q <= direct_bf22;
+    mul1_partial_sign_q <= mul1_sign;
+    mul1_partial_zero_q <= mul1_zero;
+    mul1_partial_special_q <= mul1_special;
+    mul1_partial_exp_q <= mul1_exp;
+
+    // M1A: add the shifted partials and capture the exact 28-bit product.
+    mul1_mode_q <= mul1_partial_mode_q;
+    mul1_payload_q <= mul1_partial_payload_q;
+    mul1_direct_q <= mul1_partial_direct_q;
+    mul1_sign_q <= mul1_partial_sign_q;
+    mul1_zero_q <= mul1_partial_zero_q;
+    mul1_special_q <= mul1_partial_special_q;
+    mul1_exp_q <= mul1_partial_exp_q;
     mul1_product_q <= mul1_product;
 
     // M2: normalize and round the first raw product once to BF22.
@@ -347,22 +347,30 @@ always @(posedge clk or negedge cpurst_b) begin
     mul2_direct_q <= mul1_direct_q;
     mul2_product_bf22_q <= mul1_product_bf22;
 
-    // M3: second pure 14x14 multiply for SiLU; all other modes bypass it.
-    final_mode_q <= mul2_mode_q;
-    final_bypass_bf22_q <= stage3_bypass_bf22;
-    mul3_sign_q <= mul3_sign;
-    mul3_zero_q <= mul3_zero;
-    mul3_special_q <= mul3_special;
-    mul3_exp_q <= mul3_exp;
+    // M3P: second pair of 14x7 partials for SiLU; other modes relay.
+    mul3_partial_mode_q <= mul2_mode_q;
+    mul3_partial_bypass_bf22_q <= stage3_bypass_bf22;
+    mul3_partial_sign_q <= mul3_sign;
+    mul3_partial_zero_q <= mul3_zero;
+    mul3_partial_special_q <= mul3_special;
+    mul3_partial_exp_q <= mul3_exp;
+
+    // M3A: shifted partial add and exact-product capture.
+    final_mode_q <= mul3_partial_mode_q;
+    final_bypass_bf22_q <= mul3_partial_bypass_bf22_q;
+    mul3_sign_q <= mul3_partial_sign_q;
+    mul3_zero_q <= mul3_partial_zero_q;
+    mul3_special_q <= mul3_partial_special_q;
+    mul3_exp_q <= mul3_partial_exp_q;
     mul3_product_q <= mul3_product;
 
-    // M4: second-product pack (SiLU) or bypass, followed by BF16 store round.
+    // Output: second-product pack (SiLU) or bypass, then BF16 store round.
     value_pipe[0] <= final_result_bits;
     for (stage = 1; stage <= OUTPUT_PIPE_LAST; stage = stage + 1)
       value_pipe[stage] <= value_pipe[stage - 1];
 
-    valid_pipe[0] <= in_valid;
-    mode_pipe[0] <= in_mode;
+    valid_pipe[0] <= relay_valid_q;
+    mode_pipe[0] <= relay_mode_q;
     for (stage = 1; stage < POST_STAGES; stage = stage + 1) begin
       valid_pipe[stage] <= valid_pipe[stage - 1];
       mode_pipe[stage] <= mode_pipe[stage - 1];

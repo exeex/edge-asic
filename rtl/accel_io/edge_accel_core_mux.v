@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module edge_accel_core_mux #(
-  parameter ACTU_LATENCY = 15
+  parameter ACTU_LATENCY = 20
 ) (
   input wire clk,
   input wire cpurst_b,
@@ -30,6 +30,7 @@ module edge_accel_core_mux #(
   input wire actu_in_ready,
   output wire [2:0] actu_in_mode,
   output wire [15:0] actu_in_bf16,
+  output wire actu_in_last,
   input wire actu_out_valid,
   input wire [15:0] actu_out_bf16,
 
@@ -65,6 +66,7 @@ assign io_in_ready = (io_owner == OWNER_CMPU) ? cmpu_in_ready : actu_in_ready;
 assign actu_in_valid = io_in_valid && (io_owner == OWNER_ACTU);
 assign actu_in_mode = io_mode[2:0];
 assign actu_in_bf16 = io_src0;
+assign actu_in_last = io_last;
 
 assign cmpu_start_valid = io_start_valid && (io_owner == OWNER_CMPU);
 assign cmpu_start_mode = io_mode;

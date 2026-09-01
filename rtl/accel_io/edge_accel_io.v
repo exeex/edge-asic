@@ -54,6 +54,7 @@ module edge_accel_io #(
   output wire core_out_ready,
   input wire [15:0] core_out_data,
   input wire core_out_last,
+  input wire core_job_done,
   input wire core_result_valid,
   output wire core_result_ready
 );
@@ -479,7 +480,7 @@ always @(posedge clk or negedge cpurst_b) begin
       end else if (dst_enable_q && (streamed_q == n_q) &&
                    (wr_committed_q == n_q) &&
                    (wr_fifo_count_q == 2'd0) &&
-                   (wr_pack_count_q == 0)) begin
+                   (wr_pack_count_q == 0) && core_job_done) begin
         state_q <= STATE_IDLE;
         done_q <= 1'b1;
       end

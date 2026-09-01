@@ -2,7 +2,7 @@
 
 module edge_accel_io_unit #(
   parameter ADDR_WIDTH = 16,
-  parameter ACTU_LATENCY = 15
+  parameter ACTU_LATENCY = 20
 ) (
   input wire clk, input wire cpurst_b,
   input wire start_valid, output wire start_ready,
@@ -47,15 +47,18 @@ wire cmpu_result_valid_i, cmpu_result_ready_i;
 wire [15:0] cmpu_result_max, cmpu_result_argmax;
 wire [15:0] cmpu_result_min, cmpu_result_argmin;
 wire actu_in_valid_i, actu_in_ready_i, actu_out_valid_i;
+wire actu_in_last_i;
 wire [2:0] actu_in_mode_i, actu_out_mode_i;
 wire [15:0] actu_in_bf16_i, actu_out_bf16_i;
 wire actu_sum_valid_i;
+wire actu_sum_done_i;
 wire [31:0] actu_sum_bits_i;
 reg [31:0] last_actu_sum_q;
 reg [31:0] active_actu_scalar_q;
 wire actu_job_start = core_start_valid && core_start_ready && !core_owner;
 wire [31:0] selected_actu_scalar = (core_mode == 4'd7) ?
                                            last_actu_sum_q : active_actu_scalar_q;
+wire core_job_done = core_owner || (core_mode != 4'd5) || actu_sum_done_i;
 assign actu_last_sum_bits = last_actu_sum_q;
 
 edge_accel_io #(.ADDR_WIDTH(ADDR_WIDTH)) io (
@@ -76,6 +79,7 @@ edge_accel_io #(.ADDR_WIDTH(ADDR_WIDTH)) io (
  .core_src2(core_src2),.core_index(core_index),.core_last(core_last),
  .core_out_valid(core_out_valid),.core_out_ready(core_out_ready),
  .core_out_data(core_out_data),.core_out_last(core_out_last),
+ .core_job_done(core_job_done),
  .core_result_valid(core_result_valid),.core_result_ready(core_result_ready));
 
 edge_accel_core_mux #(.ACTU_LATENCY(ACTU_LATENCY)) mux (
@@ -89,6 +93,7 @@ edge_accel_core_mux #(.ACTU_LATENCY(ACTU_LATENCY)) mux (
  .io_result_min_value(result_min),.io_result_argmin_idx(result_argmin),
  .actu_in_valid(actu_in_valid_i),.actu_in_ready(actu_in_ready_i),
  .actu_in_mode(actu_in_mode_i),.actu_in_bf16(actu_in_bf16_i),
+ .actu_in_last(actu_in_last_i),
  .actu_out_valid(actu_out_valid_i),.actu_out_bf16(actu_out_bf16_i),
  .cmpu_start_valid(cmpu_start_valid),.cmpu_start_ready(cmpu_start_ready),
  .cmpu_start_mode(cmpu_start_mode),.cmpu_in_valid(cmpu_in_valid),
@@ -113,11 +118,13 @@ edge_cmpu cmpu (
 
 edge_actu_bf16_stream #(.PIPE_STAGES(ACTU_LATENCY)) actu (
  .clk(clk),.cpurst_b(cpurst_b),.in_valid(actu_in_valid_i),
+ .in_last(actu_in_last_i),
  .in_ready(actu_in_ready_i),.in_mode(actu_in_mode_i),.in_bf16(actu_in_bf16_i),
  .in_scalar_bits(selected_actu_scalar),
  .softmax_sum_clear(actu_job_start && (core_mode == 4'd5)),
  .out_valid(actu_out_valid_i),.out_mode(actu_out_mode_i),
  .out_bf16(actu_out_bf16_i),.softmax_sum_valid(actu_sum_valid_i),
+ .softmax_sum_done(actu_sum_done_i),
  .softmax_sum_bits(actu_sum_bits_i));
 
 always @(posedge clk or negedge cpurst_b) begin
