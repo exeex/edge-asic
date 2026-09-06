@@ -49,16 +49,16 @@ reg         egress_sum_clear_q;
 integer stage;
 
 wire nonlinear_valid;
-wire [31:0] nonlinear_bits;
+wire [21:0] nonlinear_bf22;
 
 edge_actu_rcp_rsqrt_pipe x_rcp_rsqrt (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .in_valid(ingress_valid_q),
   .in_rsqrt(ingress_mode_q == EDGE_ACTU_MODE_RSQRT),
-  .in_value({ingress_divisor_q, 10'b0}),
+  .in_value_bf22(ingress_divisor_q),
   .out_valid(nonlinear_valid),
-  .out_value(nonlinear_bits)
+  .out_value_bf22(nonlinear_bf22)
 );
 
 assign out_valid = egress_valid_q;
@@ -105,7 +105,7 @@ always @(posedge clk or negedge cpurst_b) begin
     egress_mode_q <= mode_pipe[ALIGN_LATENCY-1];
     egress_payload_q <= payload_pipe[ALIGN_LATENCY-1];
     egress_primary_q <= primary_pipe[ALIGN_LATENCY-1];
-    egress_rcp_q <= nonlinear_bits[31:10];
+    egress_rcp_q <= nonlinear_bf22;
     egress_sum_clear_q <= sum_clear_pipe[ALIGN_LATENCY-1];
     mode_pipe[0] <= ingress_mode_q;
     payload_pipe[0] <= ingress_payload_q;

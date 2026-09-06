@@ -33,7 +33,8 @@ localparam [2:0] EDGE_ACTU_MODE_SOFTMAX_NORMALIZE = 3'd7;
 localparam [21:0] BF22_ONE = 22'h0fe000;
 localparam [18:0] BF22_ONE_EXT = {14'h2000, 5'b0};
 
-wire [31:0] exp_lut_bits;
+wire [28:0] exp_product_q28;
+wire [21:0] exp_packed_bf22;
 wire [21:0] exp_lut_bf22;
 wire [18:0] aligned_e_s1;
 wire [19:0] den_raw_s1;
@@ -90,19 +91,7 @@ reg [19:0]  bypass_add_raw_s1;
 reg [7:0]   bypass_add_exp_s1;
 integer     bypass_shift;
 
-function [21:0] bf22_round_native;
-  input [31:0] bits;
-  reg [21:0] main;
-  begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      bf22_round_native = 22'h1ff000;
-    end else begin
-      main = bits[31:10];
-      bf22_round_native = main +
-                          (bits[9] && (|bits[8:0] || main[0]));
-    end
-  end
-endfunction
+
 
 
 
@@ -292,10 +281,14 @@ always @* begin
                       {1'b0, bypass_small_ext};
 end
 
-edge_actu_exp2_split_core x_exp_core (
-  .exp2_k(exp2_k),.frac_code(frac_code),.value_bits(exp_lut_bits)
+edge_actu_exp2_split_mant_q14 x_exp_mant (
+  .frac_code(frac_code), .mant_product_q28(exp_product_q28), .mant_q14()
 );
-assign exp_lut_bf22 = exp_underflow ? 22'b0 : bf22_round_native(exp_lut_bits);
+edge_actu_exp2_pack_q28_bf22 x_exp_pack (
+  .exp2_k(exp2_k), .mant_product_q28(exp_product_q28),
+  .value_bf22(exp_packed_bf22)
+);
+assign exp_lut_bf22 = exp_underflow ? 22'b0 : exp_packed_bf22;
 assign aligned_e_s1 = align_to_one_grs(exp_s0);
 assign den_raw_s1 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1};
 assign tanh_num_raw_s1 = (aligned_e_s1 >= BF22_ONE_EXT) ? 19'b0 :

@@ -5,9 +5,9 @@ module edge_actu_rcp_rsqrt_pipe (
   input  wire        cpurst_b,
   input  wire        in_valid,
   input  wire        in_rsqrt,
-  input  wire [31:0] in_value,
+  input  wire [21:0] in_value_bf22,
   output wire        out_valid,
-  output wire [31:0] out_value
+  output wire [21:0] out_value_bf22
 );
 
 reg         valid_s0, valid_s1, valid_s2, valid_s3;
@@ -48,16 +48,16 @@ wire                 result_is_one;
 wire [17:0]          normalized_result;
 wire signed [10:0]   result_exp;
 wire signed [11:0]   biased_exp;
-wire [22:0]          result_fraction;
+wire [12:0]          result_fraction;
 
-assign mant_idx = in_value[22:18];
-assign unbiased_exp = {2'b0, in_value[30:23]} - 10'sd127;
+assign mant_idx = in_value_bf22[12:8];
+assign unbiased_exp = {2'b0, in_value_bf22[20:13]} - 10'sd127;
 assign exponent_odd = unbiased_exp[0];
-assign mant_q16 = {1'b0, 1'b1, in_value[22:7]};
+assign mant_q16 = {1'b0, 1'b1, in_value_bf22[12:0], 3'b0};
 assign norm_q16 = in_rsqrt && exponent_odd ? (mant_q16 << 1) : mant_q16;
-assign invalid_input = (in_value[30:0] == 31'b0)
-                    || (in_value[30:23] == 8'hff)
-                    || (in_rsqrt && in_value[31]);
+assign invalid_input = (in_value_bf22[20:0] == 21'b0)
+                    || (in_value_bf22[20:13] == 8'hff)
+                    || (in_rsqrt && in_value_bf22[21]);
 
 edge_actu_rcp_rsqrt_seed_q16 x_seed (
   .mant_idx(mant_idx),
@@ -112,11 +112,11 @@ assign result_is_one = (result_s6 == 18'h10000);
 assign normalized_result = result_is_one ? result_s6 : (result_s6 << 1);
 assign result_exp = result_is_one ? scale_exp : (scale_exp - 11'sd1);
 assign biased_exp = result_exp + 12'sd127;
-assign result_fraction = {normalized_result[15:0], 7'b0};
+assign result_fraction = normalized_result[15:3];
 assign out_valid = valid_s6;
-assign out_value = invalid_s6 ? 32'b0 :
-                   (biased_exp <= 0 ? 32'b0 :
-                    (biased_exp >= 255 ? {sign_s6, 8'hfe, 23'h7fffff} :
+assign out_value_bf22 = invalid_s6 ? 22'b0 :
+                   (biased_exp <= 0 ? 22'b0 :
+                    (biased_exp >= 255 ? {sign_s6, 8'hfe, 13'h1fff} :
                      {sign_s6, biased_exp[7:0], result_fraction}));
 
 always @(posedge clk or negedge cpurst_b) begin
@@ -159,7 +159,7 @@ always @(posedge clk or negedge cpurst_b) begin
     rsqrt_s4 <= rsqrt_s3;
     rsqrt_s5 <= rsqrt_s4;
     rsqrt_s6 <= rsqrt_s5;
-    sign_s0 <= in_rsqrt ? 1'b0 : in_value[31];
+    sign_s0 <= in_rsqrt ? 1'b0 : in_value_bf22[21];
     sign_s1 <= sign_s0;
     sign_s2 <= sign_s1;
     sign_s3 <= sign_s2;

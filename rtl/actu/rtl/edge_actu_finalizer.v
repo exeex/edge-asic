@@ -117,19 +117,14 @@ assign out_valid = valid_pipe[POST_STAGES-1];
 assign out_mode = mode_pipe[POST_STAGES-1];
 assign out_value = value_pipe[OUTPUT_PIPE_LAST];
 
-function [31:0] bf16_round_bits;
-  input [31:0] bits;
-  reg [15:0] rounded;
+function [15:0] bf22_to_bf16;
+  input [21:0] bits;
   begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      rounded = 16'h7fc0;
-    end else begin
-      rounded = bits[31:16] +
-                {15'b0, (bits[15] && (|bits[14:0] || bits[16]))};
-      if ((rounded == 16'h0000) && bits[31])
-        rounded = 16'h8000;
-    end
-    bf16_round_bits = {rounded, 16'h0000};
+    if ((bits[20:13] == 8'hff) && (bits[12:0] != 13'b0))
+      bf22_to_bf16 = 16'h7fc0;
+    else
+      bf22_to_bf16 = bits[21:6] +
+                    {15'b0, (bits[5] && (|bits[4:0] || bits[6]))};
   end
 endfunction
 
@@ -255,7 +250,7 @@ assign stage3_bypass_bf22 =
        mul2_product_bf22_q : mul2_direct_q));
 assign final_result_bf22 = (final_mode_q == EDGE_ACTU_MODE_SILU) ?
                            mul3_product_bf22 : final_bypass_bf22_q;
-assign final_result_bits = bf16_round_bits({final_result_bf22, 10'b0});
+assign final_result_bits = {bf22_to_bf16(final_result_bf22), 16'b0};
 
 edge_actu_softmax_rsum x_softmax_rsum (
   .clk(clk),
