@@ -22,15 +22,17 @@ module edge_actu_exp_range_bf22_prepare (
 );
 wire [7:0] exponent = value_bf22[20:13];
 wire is_special = exponent == 8'hff;
-wire clamp_high = !sign_z && (value_bf22[20:0] >= (31'h42b00000 >> 10));
+wire clamp_high = !sign_z && (value_bf22[20:0] >= 21'h10ac00);
 wire tiny = exponent < 8'd111; // abs(x) < 2^-16 cannot contribute to Q16.
-wire [4:0] shift = 5'd6 - exponent[4:0]; // 134-exp, only 1..23 when active.
-wire [23:0] significand = {1'b1,value_bf22[12:0],10'b0};
-wire [23:0] shifted = significand >> shift;
+// For active exponents 111..133, Q16 = significand * 2^(exponent-124).
+// Shift only by the low four exponent bits; fixed slices supply the scale.
+wire [28:0] shifted = {15'b0,1'b1,value_bf22[12:0]} << exponent[3:0];
+wire [22:0] finite_magnitude = exponent[7] ? {shifted[18:0],4'b0} :
+                               exponent[4] ? {6'b0,shifted[28:12]} : 23'd1;
 assign sign_z = value_bf22[21];
-assign underflow = sign_z && (value_bf22 >= (32'hc2ae0000 >> 10));
+assign underflow = sign_z && (value_bf22 >= 22'h30ab80);
 assign magnitude_q16 = (underflow || is_special || tiny) ? 23'b0 :
-                       clamp_high ? 23'd5767168 : shifted[22:0];
+                       clamp_high ? 23'd5767168 : finite_magnitude;
 endmodule
 
 module edge_actu_exp_range_bf22_scale (

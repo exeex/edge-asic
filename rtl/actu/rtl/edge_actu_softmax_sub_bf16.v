@@ -88,10 +88,15 @@ always @* begin
   if (probe[16:9] == 0) begin probe = probe << 8; count = count + 5'd8; end
   if (probe[16:13] == 0) begin probe = probe << 4; count = count + 5'd4; end
   if (probe[16:15] == 0) begin probe = probe << 2; count = count + 5'd2; end
-  if (!probe[16]) count = count + 5'd1;
-  // Keep exponent one for a subnormal; packing below restores exponent zero.
-  if ({4'b0,count} >= exponent) count = exponent[4:0] - 5'd1;
-  normalized = normalized << count;
+  if (!probe[16]) begin probe = probe << 1; count = count + 5'd1; end
+  // Reuse the leading-zero probe for normal results. Only the subnormal
+  // path needs a separate exponent-limited shift; packing restores exponent zero.
+  if ({4'b0,count} >= exponent) begin
+    count = exponent[4:0] - 5'd1;
+    normalized = normalized << count;
+  end else begin
+    normalized = probe;
+  end
   exponent = exponent - {4'b0,count};
   increment = normalized[2] && (|normalized[1:0] || normalized[3]);
   rounded = {1'b0,normalized[16:3]} + {14'b0,increment};
