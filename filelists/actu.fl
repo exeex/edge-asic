@@ -17,3 +17,6 @@ rtl/actu/rtl/edge_actu_finalizer.v
 rtl/actu/edge_actu.v
 rtl/actu/rtl/edge_actu_bf16_stream.v
 rtl/actu/rtl/edge_actu_unit.v
+rtl/actu/rtl/edge_actu_exp_ingress.v
+rtl/actu/rtl/edge_actu_exp_range_bf22.v
+rtl/actu/rtl/edge_actu_softmax_sub_bf16.v

@@ -9,10 +9,12 @@ module edge_actu_exp_frontend (
   input  wire        in_valid,
   input  wire        in_last,
   input  wire [2:0]  in_mode,
-  input  wire [31:0] in_value,
-  input  wire [31:0] in_scalar,
+  input  wire [15:0] in_value_bf16,
+  input  wire [21:0] in_scalar_bf22,
   input  wire        in_sum_clear,
-  input  wire [31:0] exp_input_bits,
+  input  wire exp_underflow,
+  input wire signed [9:0] exp2_k,
+  input wire [11:0] frac_code,
   output reg         out_valid,
   output reg         out_last,
   output reg  [2:0]  out_mode,
@@ -102,19 +104,7 @@ function [21:0] bf22_round_native;
   end
 endfunction
 
-function [18:0] bf19_round_native;
-  input [31:0] bits;
-  reg [18:0] main;
-  begin
-    if ((bits[30:23] == 8'hff) && (bits[22:0] != 23'b0)) begin
-      bf19_round_native = 19'h3fc00;
-    end else begin
-      main = bits[31:13];
-      bf19_round_native = main +
-                          (bits[12] && (|bits[11:0] || main[0]));
-    end
-  end
-endfunction
+
 
 // Align positive BF22 e to the 1.0 exponent with five GRS bits. Fused modes
 // guarantee 0 <= e <= 1; values above one are clamped to the exact-one rail.
@@ -302,12 +292,10 @@ always @* begin
                       {1'b0, bypass_small_ext};
 end
 
-edge_actu_exp_lut2base_split x_exp_lut (
-  .value_bits(exp_input_bits),
-  .exp_bits(exp_lut_bits)
+edge_actu_exp2_split_core x_exp_core (
+  .exp2_k(exp2_k),.frac_code(frac_code),.value_bits(exp_lut_bits)
 );
-
-assign exp_lut_bf22 = bf22_round_native(exp_lut_bits);
+assign exp_lut_bf22 = exp_underflow ? 22'b0 : bf22_round_native(exp_lut_bits);
 assign aligned_e_s1 = align_to_one_grs(exp_s0);
 assign den_raw_s1 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1};
 assign tanh_num_raw_s1 = (aligned_e_s1 >= BF22_ONE_EXT) ? 19'b0 :
@@ -368,11 +356,11 @@ always @(posedge clk or negedge cpurst_b) begin
     valid_s0 <= in_valid;
     last_s0 <= in_last;
     mode_s0 <= in_mode;
-    payload_bf19_s0 <= bf19_round_native(in_value);
+    payload_bf19_s0 <= {in_value_bf16,3'b0};
     sum_clear_s0 <= in_sum_clear;
     exp_s0 <= exp_lut_bf22;
-    value_bf22_s0 <= bf22_round_native(in_value);
-    scalar_bf22_s0 <= bf22_round_native(in_scalar);
+    value_bf22_s0 <= {in_value_bf16,6'b0};
+    scalar_bf22_s0 <= in_scalar_bf22;
 
     // F1: shared alignment and parallel 1+e / 1-e raw arithmetic.
     valid_s1 <= valid_s0;
