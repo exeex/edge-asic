@@ -73,7 +73,8 @@ reg [13:0] align_b_sig;
 reg [18:0] align_large_sig;
 reg [18:0] align_small_sig;
 reg        align_sticky;
-integer    align_shift;
+reg [7:0]  align_shift;
+reg [13:0] align_small_mant;
 
 reg [18:0] normalized_sig;
 reg [7:0]  normalized_exp;
@@ -93,42 +94,36 @@ always @* begin
   align_small_sig = 19'b0;
   align_sticky = 1'b0;
   align_shift = 0;
+  align_small_mant = 14'b0;
   if (align_a_sig == 0) begin
     align_bypass = 1'b1;
     align_bypass_value = op_b;
   end else if (align_b_sig == 0) begin
     align_bypass = 1'b1;
     align_bypass_value = op_a;
-  end else if ((op_b[20:13] > op_a[20:13]) ||
-               ((op_b[20:13] == op_a[20:13]) &&
-                (align_b_sig > align_a_sig))) begin
-    align_large_exp = (op_b[20:13] == 0) ? 8'd1 : op_b[20:13];
-    align_small_exp = (op_a[20:13] == 0) ? 8'd1 : op_a[20:13];
-    align_large_sig = {align_b_sig,5'b0};
-    align_shift = {24'b0,align_large_exp} - {24'b0,align_small_exp};
-    if (align_shift >= 19)
-      align_small_sig = {18'b0,|align_a_sig};
-    else if (align_shift == 0)
-      align_small_sig = {align_a_sig,5'b0};
-    else begin
-      align_sticky = |({align_a_sig,5'b0} &
-                       ((19'b1 << align_shift) - 19'b1));
-      align_small_sig = ({align_a_sig,5'b0} >> align_shift) |
-                        {18'b0,align_sticky};
-    end
   end else begin
-    align_large_exp = (op_a[20:13] == 0) ? 8'd1 : op_a[20:13];
-    align_small_exp = (op_b[20:13] == 0) ? 8'd1 : op_b[20:13];
-    align_large_sig = {align_a_sig,5'b0};
-    align_shift = {24'b0,align_large_exp} - {24'b0,align_small_exp};
+    // Equal exponents require no alignment: positive addition is commutative.
+    // Select the operands first so both orders share one sticky shifter.
+    if (op_b[20:13] > op_a[20:13]) begin
+      align_large_exp = (op_b[20:13] == 0) ? 8'd1 : op_b[20:13];
+      align_small_exp = (op_a[20:13] == 0) ? 8'd1 : op_a[20:13];
+      align_large_sig = {align_b_sig,5'b0};
+      align_small_mant = align_a_sig;
+    end else begin
+      align_large_exp = (op_a[20:13] == 0) ? 8'd1 : op_a[20:13];
+      align_small_exp = (op_b[20:13] == 0) ? 8'd1 : op_b[20:13];
+      align_large_sig = {align_a_sig,5'b0};
+      align_small_mant = align_b_sig;
+    end
+    align_shift = align_large_exp - align_small_exp;
     if (align_shift >= 19)
-      align_small_sig = {18'b0,|align_b_sig};
+      align_small_sig = {18'b0,|align_small_mant};
     else if (align_shift == 0)
-      align_small_sig = {align_b_sig,5'b0};
+      align_small_sig = {align_small_mant,5'b0};
     else begin
-      align_sticky = |({align_b_sig,5'b0} &
+      align_sticky = |({align_small_mant,5'b0} &
                        ((19'b1 << align_shift) - 19'b1));
-      align_small_sig = ({align_b_sig,5'b0} >> align_shift) |
+      align_small_sig = ({align_small_mant,5'b0} >> align_shift) |
                         {18'b0,align_sticky};
     end
   end

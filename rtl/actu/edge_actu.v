@@ -196,11 +196,39 @@ function [31:0] fp32_add_bits;
           fp32_add_bits = 32'b0;
         end else begin
           norm_sig = large_sig - small_sig;
-          for (norm_count = 0; norm_count < 24; norm_count = norm_count + 1) begin
-            if (!norm_sig[26] && (large_exp > -12'sd126)) begin
-              norm_sig = norm_sig << 1;
-              large_exp = large_exp - 12'sd1;
+          // Find the leading-zero count independently of the exponent budget.
+          begin : normalize_lzc
+            reg [26:0] probe;
+            reg [4:0] count;
+            reg signed [12:0] budget;
+            probe = norm_sig;
+            count = 0;
+            if (probe[26:11] == 0) begin
+              probe = probe << 16;
+              count = count + 5'd16;
             end
+            if (probe[26:19] == 0) begin
+              probe = probe << 8;
+              count = count + 5'd8;
+            end
+            if (probe[26:23] == 0) begin
+              probe = probe << 4;
+              count = count + 5'd4;
+            end
+            if (probe[26:25] == 0) begin
+              probe = probe << 2;
+              count = count + 5'd2;
+            end
+            if (probe[26:26] == 0) begin
+              probe = probe << 1;
+              count = count + 5'd1;
+            end
+            if (count > 24) count = 24;
+            budget = $signed({large_exp[11],large_exp}) + 13'sd126;
+            if (budget <= 0) count = 0;
+            else if ($signed({8'b0,count}) > budget) count = budget[4:0];
+            norm_sig = norm_sig << count;
+            large_exp = large_exp - $signed({7'b0,count});
           end
           fp32_add_bits = fp32_pack_from_grs(large_sign, large_exp, norm_sig);
         end

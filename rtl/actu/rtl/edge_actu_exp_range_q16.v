@@ -16,16 +16,14 @@ wire [7:0]  exponent;
 wire [22:0] fraction;
 wire [23:0] mantissa;
 wire [30:0] magnitude_bits;
-wire        is_zero;
 wire        is_special;
 wire        clamp_high;
-wire signed [8:0] unbiased_exp;
-wire signed [9:0] xq_shift;
-wire [55:0] shifted_left;
-wire [55:0] shifted_right;
+wire [5:0] right_shift;
+wire [23:0] shifted_mantissa;
 wire [31:0] x_mag_q16;
 wire signed [31:0] x_q16_pre;
-wire signed [31:0] x_q16;
+// The selected magnitude fits 24 bits even for wrapped legacy shifts.
+wire signed [24:0] x_q16;
 wire signed [63:0] z_product_q48;
 wire signed [63:0] z_shifted;
 wire signed [31:0] z_code;
@@ -35,23 +33,19 @@ assign sign = value_bits[31];
 assign exponent = value_bits[30:23];
 assign fraction = value_bits[22:0];
 assign magnitude_bits = value_bits[30:0];
-assign is_zero = (magnitude_bits == 31'b0);
 assign is_special = (exponent == 8'hff);
 assign underflow = sign && (value_bits >= EXP_UNDERFLOW_NEG_BITS);
 assign clamp_high = (!sign) && (magnitude_bits >= EXP_CLAMP_POS_MAG_BITS);
 
 assign mantissa = (exponent == 8'b0) ? {1'b0, fraction} : {1'b1, fraction};
-assign unbiased_exp = (exponent == 8'b0) ? -9'sd126 :
-                      ({1'b0, exponent} - 9'sd127);
-assign xq_shift = unbiased_exp - 10'sd7;
-assign shifted_left = {32'b0, mantissa} << xq_shift[5:0];
-assign shifted_right = {32'b0, mantissa} >> ((-xq_shift) & 10'h03f);
-assign x_mag_q16 = is_zero ? 32'b0 :
-                   (xq_shift >= 0 ? shifted_left[31:0] :
-                    shifted_right[31:0]);
+// Inputs needing a left shift are already replaced by clamp/underflow.
+// Preserve the existing modulo-64 right shift, including subnormal inputs.
+assign right_shift = (exponent == 0) ? 6'd5 : (6'd6 - exponent[5:0]);
+assign shifted_mantissa = mantissa >> right_shift;
+assign x_mag_q16 = {8'b0, shifted_mantissa};
 assign x_q16_pre = sign ? -$signed(x_mag_q16) : $signed(x_mag_q16);
-assign x_q16 = (underflow || is_special) ? 32'sd0 :
-               (clamp_high ? 32'sd5767168 : x_q16_pre);
+assign x_q16 = (underflow || is_special) ? 25'sd0 :
+               (clamp_high ? 25'sd5767168 : x_q16_pre[24:0]);
 
 assign z_product_q48 = x_q16 * LOG2E_CODE_Q16;
 assign z_shifted = z_product_q48 >>> 32;

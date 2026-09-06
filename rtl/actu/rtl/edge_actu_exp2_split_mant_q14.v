@@ -10,12 +10,21 @@ reg [14:0] hi_lut [0:255];
 reg [14:0] lo_lut [0:15];
 wire [7:0] hi_idx;
 wire [3:0] lo_idx;
+wire [14:0] hi_value;
+wire [14:0] lo_value;
+wire [20:0] residual_product;
 wire [29:0] mant_product_full_q28;
 wire [29:0] mant_rounded_q28;
 
 assign hi_idx = frac_code[11:4];
 assign lo_idx = frac_code[3:0];
-assign mant_product_full_q28 = hi_lut[hi_idx] * lo_lut[lo_idx];
+assign hi_value = hi_lut[hi_idx];
+assign lo_value = lo_lut[lo_idx];
+// Every low-table entry is 2^14 plus a six-bit residual (0..42).
+// Expose the narrow multiply explicitly; preserve the exact Q28 product.
+assign residual_product = hi_value * lo_value[5:0];
+assign mant_product_full_q28 = {1'b0, hi_value, 14'b0} +
+                               {9'b0, residual_product};
 assign mant_product_q28 = mant_product_full_q28[28:0];
 assign mant_rounded_q28 = mant_product_full_q28 + 30'h0000_2000;
 assign mant_q14 = mant_rounded_q28[28:14];
