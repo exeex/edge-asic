@@ -257,10 +257,11 @@ endfunction
 // Direct RSQRT uses positive x+epsilon. Perform only alignment/addition here;
 // F2 owns normalization and RNE packing so no generic FP32 adder crosses the
 // frontend/backend boundary.
+// Equal exponents need no significand ordering: neither operand shifts and
+// their unsigned sum is commutative. Keep the ordering mux off the fraction
+// comparator path; exponent zero still uses its effective exponent of one.
 always @* begin
-  if ((scalar_bf22_s0[20:13] > value_bf22_s0[20:13]) ||
-      ((scalar_bf22_s0[20:13] == value_bf22_s0[20:13]) &&
-       (scalar_bf22_s0[12:0] > value_bf22_s0[12:0]))) begin
+  if (scalar_bf22_s0[20:13] > value_bf22_s0[20:13]) begin
     bypass_large_exp = (scalar_bf22_s0[20:13] == 0) ?
                        8'd1 : scalar_bf22_s0[20:13];
     bypass_small_exp = (value_bf22_s0[20:13] == 0) ?
