@@ -14,7 +14,8 @@ module edge_actu_exp_frontend (
   input  wire        in_sum_clear,
   input  wire exp_underflow,
   input wire signed [9:0] exp2_k,
-  input wire [11:0] frac_code,
+  input wire [14:0] exp_hi,
+  input wire [20:0] exp_residual_product,
   output reg         out_valid,
   output reg         out_last,
   output reg  [2:0]  out_mode,
@@ -281,9 +282,8 @@ always @* begin
                       {1'b0, bypass_small_ext};
 end
 
-edge_actu_exp2_split_mant_q14 x_exp_mant (
-  .frac_code(frac_code), .mant_product_q28(exp_product_q28), .mant_q14()
-);
+// F0: G6 already captured the lookup and residual multiplication.
+assign exp_product_q28={exp_hi,14'b0}+{8'b0,exp_residual_product};
 edge_actu_exp2_pack_q28_bf22 x_exp_pack (
   .exp2_k(exp2_k), .mant_product_q28(exp_product_q28),
   .value_bf22(exp_packed_bf22)

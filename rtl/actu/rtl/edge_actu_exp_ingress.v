@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-// Seven captures: BF16 subtract decode/coarse/fine/add/pack, Q12 prepare, scale.
+// Seven captures: decode/coarse/fine/add+normalize/RNE+Q12/multiply/LUT+multiply.
 // Every mode and sideband takes the same path; scalar epsilon is BF16, while the retained sum is BF22.
 module edge_actu_exp_ingress (
   input wire clk, cpurst_b, in_valid, in_last, in_sum_clear,
@@ -13,9 +13,14 @@ module edge_actu_exp_ingress (
   output reg [21:0] out_scalar_bf22,
   output reg out_underflow,
   output reg signed [9:0] out_exp2_k,
+  output reg [20:0] out_residual_product,
+  output reg [14:0] out_hi,
+  output reg [5:0] out_residual,
   output reg [11:0] out_frac_code
 );
-wire [15:0] delta_bf16;
+wire [15:0] delta_bf16, delta_before_capture;
+reg [18:0] magnitude_q;
+reg prepared_sign_q, prepared_underflow_q;
 wire delta_valid;
 reg [21:0] native_operand_q [0:4];
 reg [15:0] range_low_q;
@@ -41,33 +46,40 @@ function [21:0] native_exp_operand;
     else native_exp_operand={value,6'b0};
   end
 endfunction
-// G0..G4: one dedicated capture per subtract operation, single BF16 RNE.
+// G3 adds and normalizes; G4 rounds and prepares Q12 before capture.
 edge_actu_softmax_sub_bf16_pipe x_subtract (
   .clk(clk),.cpurst_b(cpurst_b),.in_valid(in_valid),
   .value_bf16(in_value_bf16),.max_bf16(in_scalar_bits[31:16]),
-  .out_valid(delta_valid),.delta_bf16(delta_bf16)
+  .out_valid(delta_valid),.delta_bf16(delta_bf16),.delta_before_capture(delta_before_capture)
 );
 wire range_underflow, range_sign;
 wire [18:0] range_magnitude;
 wire signed [9:0] range_k;
 wire [11:0] range_frac;
-// G5 selects/prepares Q12 and computes both constant partial products in parallel.
+// G4 selects/prepares Q12. G5 only computes constant partial products.
 edge_actu_exp_range_bf22_prepare x_range_prepare (
-  .value_bf22(mode_q[4]==3'd5 ? {delta_bf16,6'b0} : native_operand_q[4]),
+  .value_bf22(mode_q[3]==3'd5 ? {delta_before_capture,6'b0} : native_operand_q[3]),
   .underflow(range_underflow),.sign_z(range_sign),.magnitude_q12(range_magnitude)
 );
 // 23637 = 85 + (23 << 10). Low ten product bits cannot carry into bit ten.
-wire [25:0] range_low=range_magnitude*7'd85;
-wire [23:0] range_high=range_magnitude*5'd23;
+wire [25:0] range_low=magnitude_q*7'd85;
+wire [23:0] range_high=magnitude_q*5'd23;
 // G6 combines truncated partial products and applies the separate sign.
 edge_actu_exp_range_bf22_scale_parts x_range_scale (
   .negative_nonzero(sign_q),.low_q(range_low_q),.high_q(range_high_q),
   .exp2_k(range_k),.frac_code(range_frac)
 );
+wire [14:0] range_hi;
+wire [5:0] range_residual;
+// G6 looks up each fraction slice while integer exponent bits resolve.
+edge_actu_exp_lut_pair x_lut(range_frac,range_hi,range_residual);
 always @(posedge clk) begin
+  out_hi<=range_hi;out_residual<=range_residual;
+  out_residual_product<=range_hi*range_residual;
   native_operand_q[0]<=native_exp_operand(in_value_bf16,in_mode);
   for(stage=1;stage<5;stage=stage+1)native_operand_q[stage]<=native_operand_q[stage-1];
-  range_low_q<=range_low[25:10]; range_high_q<=range_high; sign_q<=range_sign && (|range_magnitude); underflow_q<=range_underflow;
+  range_low_q<=range_low[25:10]; range_high_q<=range_high; sign_q<=prepared_sign_q; underflow_q<=prepared_underflow_q;
+  magnitude_q<=range_magnitude;prepared_sign_q<=range_sign && (|range_magnitude);prepared_underflow_q<=range_underflow;
   mode_q[0]<=in_mode;
   value_q[0]<=in_value_bf16;
   // Only normalize carries an internal BF22 sum. External max/epsilon are BF16.

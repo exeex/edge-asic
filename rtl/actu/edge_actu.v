@@ -77,14 +77,16 @@ wire [2:0] ingress_mode;
 wire [15:0] ingress_value;
 wire [21:0] ingress_scalar;
 wire signed [9:0] ingress_k;
-wire [11:0] ingress_frac;
+wire [14:0] ingress_hi;
+wire [20:0] ingress_residual_product;
 edge_actu_exp_ingress x_exp_ingress (
   .clk(forever_cpuclk),.cpurst_b(cpurst_b),.in_valid(input_fire),
   .in_last(in_last),.in_sum_clear(softmax_sum_clear),.in_mode(in_mode),
   .in_value_bf16(in_value[31:16]),.in_scalar_bits(in_softmax_max),
   .out_valid(ingress_valid),.out_last(ingress_last),.out_sum_clear(ingress_clear),
   .out_mode(ingress_mode),.out_value_bf16(ingress_value),.out_scalar_bf22(ingress_scalar),
-  .out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(ingress_frac)
+  .out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(),.out_hi(ingress_hi),.out_residual(),
+  .out_residual_product(ingress_residual_product)
 );
 
 edge_actu_exp_frontend x_exp_frontend (
@@ -96,7 +98,7 @@ edge_actu_exp_frontend x_exp_frontend (
   .in_value_bf16(ingress_value),
   .in_scalar_bf22(ingress_scalar),
   .in_sum_clear(ingress_clear),
-  .exp_underflow(ingress_underflow),.exp2_k(ingress_k),.frac_code(ingress_frac),
+  .exp_underflow(ingress_underflow),.exp2_k(ingress_k),.exp_hi(ingress_hi),.exp_residual_product(ingress_residual_product),
   .out_valid(front_valid),
   .out_last(front_last),
   .out_mode(front_mode),

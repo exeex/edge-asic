@@ -14,12 +14,13 @@ edge_actu_softmax_sub_add x_add(aligned,sum_packet);
 edge_actu_softmax_sub_pack x_pack(sum_packet,delta_bf16);
 endmodule
 
-// Five captures: parallel decode, coarse/fine alignment, addition, normalization/RNE.
+// Five captures: decode, coarse/fine alignment, add+normalize, RNE.
 module edge_actu_softmax_sub_bf16_pipe (
   input wire clk, cpurst_b, in_valid,
   input wire [15:0] value_bf16, max_bf16,
   output wire out_valid,
-  output reg [15:0] delta_bf16
+  output reg [15:0] delta_bf16,
+  output wire [15:0] delta_before_capture
 );
 wire [56:0] decoded;
 wire [48:0] aligned;
@@ -29,15 +30,18 @@ wire [50:0] coarse;
 reg [50:0] coarse_q;
 reg [56:0] decoded_q;
 reg [48:0] aligned_q;
-reg [37:0] sum_q;
+wire [38:0] normalized_packet;
+reg [38:0] normalized_q;
 reg [4:0] valid_q;
 edge_actu_softmax_sub_decode x_decode(value_bf16,max_bf16,decoded);
 edge_actu_softmax_sub_align_coarse x_coarse(decoded_q,coarse);
 edge_actu_softmax_sub_align_fine x_fine(coarse_q,aligned);
 edge_actu_softmax_sub_add x_add(aligned_q,sum_packet);
-edge_actu_softmax_sub_pack x_pack(sum_q,packed_value);
+edge_actu_softmax_sub_normalize x_normalize(sum_packet,normalized_packet);
+edge_actu_softmax_sub_round x_round(normalized_q,packed_value);
+assign delta_before_capture=packed_value;
 always @(posedge clk) begin
-  decoded_q<=decoded; coarse_q<=coarse; aligned_q<=aligned; sum_q<=sum_packet;
+  decoded_q<=decoded; coarse_q<=coarse; aligned_q<=aligned; normalized_q<=normalized_packet;
   delta_bf16<=packed_value;
 end
 always @(posedge clk or negedge cpurst_b)
@@ -169,5 +173,61 @@ always @* begin
   else if(sum==0)delta_bf16=0;
   else if(exponent>=255)delta_bf16={sign_z,8'hff,7'b0};
   else delta_bf16={sign_z,exponent[7:0],rounded[6:0]};
+end
+endmodule
+
+// G3: addition is followed by normalization; no rounding yet.
+// Packet: bypass, bypass value, sign, zero, exponent, normalized 8+GRS.
+module edge_actu_softmax_sub_normalize (
+ input wire [37:0] packet,
+ output wire [38:0] normalized_packet
+);
+wire bypass,sign_z;
+wire [15:0] bypass_value;
+wire [7:0] large_exp;
+wire [11:0] sum;
+assign {bypass,bypass_value,sign_z,large_exp,sum}=packet;
+reg [10:0] normalized,probe;
+reg [3:0] count;
+reg [8:0] exponent;
+always @* begin
+ normalized=sum[11]?{sum[11:2],|sum[1:0]}:sum[10:0];
+ exponent={1'b0,large_exp}+{8'b0,sum[11]};
+ probe=normalized;count=0;
+ if(probe[10:3]==0)begin probe=probe<<8;count=count+4'd8;end
+ if(probe[10:7]==0)begin probe=probe<<4;count=count+4'd4;end
+ if(probe[10:9]==0)begin probe=probe<<2;count=count+4'd2;end
+ if(!probe[10])begin probe=probe<<1;count=count+4'd1;end
+ if({5'b0,count}>=exponent)begin
+  count=exponent[3:0]-4'd1;
+  normalized=normalized<<count;
+ end else normalized=probe;
+ exponent=exponent-{5'b0,count};
+end
+assign normalized_packet={bypass,bypass_value,sign_z,(sum==0),exponent,normalized};
+endmodule
+
+// G4: preserve the original single BF16 RNE, including exponent carry.
+module edge_actu_softmax_sub_round (
+ input wire [38:0] packet,
+ output reg [15:0] delta_bf16
+);
+wire bypass,sign_z,zero;
+wire [15:0] bypass_value;
+wire [8:0] normalized_exp;
+wire [10:0] normalized;
+assign {bypass,bypass_value,sign_z,zero,normalized_exp,normalized}=packet;
+reg [8:0] exponent,rounded;
+reg increment;
+always @* begin
+ exponent=normalized_exp;
+ increment=normalized[2]&&(|normalized[1:0]||normalized[3]);
+ rounded={1'b0,normalized[10:3]}+{8'b0,increment};
+ if(rounded[8])begin rounded=rounded>>1;exponent=exponent+9'd1;end
+ if(!rounded[7])exponent=0;
+ if(bypass)delta_bf16=bypass_value;
+ else if(zero)delta_bf16=0;
+ else if(exponent>=255)delta_bf16={sign_z,8'hff,7'b0};
+ else delta_bf16={sign_z,exponent[7:0],rounded[6:0]};
 end
 endmodule
