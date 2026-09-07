@@ -28,24 +28,24 @@ reg        drain_d0, drain_d1, drain_d2, drain_d3;
 // Prepare exponent difference before the variable alignment shifter.
 reg valid_pre, last_pre, drain_pre;
 reg bypass_pre;
-reg [21:0] bypass_value_pre;
+reg bypass_sign_pre, bypass_expzero_pre;
 reg [7:0] large_exp_pre, shift_pre;
 reg [18:0] large_sig_pre;
 reg [13:0] small_mant_pre;
 
 reg        bypass_d0;
-reg [21:0] bypass_value_d0;
+reg bypass_sign_d0, bypass_expzero_d0;
 reg [7:0]  large_exp_d0;
 reg [18:0] large_sig_d0;
 reg [18:0] small_sig_d0;
 
 reg        bypass_d1;
-reg [21:0] bypass_value_d1;
+reg bypass_sign_d1, bypass_expzero_d1;
 reg [7:0]  large_exp_d1;
 reg [19:0] sum_d1;
 
 reg        bypass_d2;
-reg [21:0] bypass_value_d2;
+reg bypass_sign_d2, bypass_expzero_d2;
 reg [7:0]  norm_exp_d2;
 reg [18:0] norm_sig_d2;
 
@@ -75,7 +75,7 @@ wire [21:0] op_b = drain_launch ? partial_second :
                        ((fill_count_q < 3'd5) ? 22'b0 : stream_feedback);
 
 reg        align_bypass;
-reg [21:0] align_bypass_value;
+reg align_bypass_sign, align_bypass_expzero;
 reg [7:0]  align_large_exp;
 reg [7:0]  align_small_exp;
 reg [13:0] align_a_sig;
@@ -96,20 +96,12 @@ always @* begin
                                              {1'b1,op_a[12:0]};
   align_b_sig = (op_b[20:13] == 0) ? {1'b0,op_b[12:0]} :
                                              {1'b1,op_b[12:0]};
-  align_bypass = 1'b0;
-  align_bypass_value = 22'b0;
-  align_large_exp = 8'b0;
-  align_small_exp = 8'b0;
-  align_large_sig = 19'b0;
-  align_shift = 0;
-  align_small_mant = 14'b0;
-  if (align_a_sig == 0) begin
-    align_bypass = 1'b1;
-    align_bypass_value = op_b;
-  end else if (align_b_sig == 0) begin
-    align_bypass = 1'b1;
-    align_bypass_value = op_a;
-  end else begin
+  // Zero operands still traverse the ordinary align/add/RNE datapath.
+  // Preserve only the original sign and exponent-zero pack semantics.
+  align_bypass = (align_a_sig==0)||(align_b_sig==0);
+  align_bypass_sign = (align_a_sig==0)?op_b[21]:op_a[21];
+  align_bypass_expzero = (align_a_sig==0)?(op_b[20:13]==0):(op_a[20:13]==0);
+  begin
     // Equal exponents require no alignment: positive addition is commutative.
     // Select the operands first so both orders share one sticky shifter.
     if (op_b[20:13] > op_a[20:13]) begin
@@ -130,7 +122,7 @@ end
 always @* begin
   align_sticky = 1'b0;
   align_small_sig = 19'b0;
-  if (!bypass_pre) begin
+  begin // Alignment runs regardless of zero-operand metadata.
     if (shift_pre >= 19)
       align_small_sig = {18'b0,|small_mant_pre};
     else if (shift_pre == 0)
@@ -163,12 +155,13 @@ end
 
 function [21:0] pack_positive_bf22;
   input        bypass;
-  input [21:0] bypass_value;
+  input bypass_sign;
+  input bypass_expzero;
   input [7:0]  exp_bits;
   input [14:0] rounded;
   begin
     if (bypass)
-      pack_positive_bf22 = bypass_value;
+      pack_positive_bf22 = {bypass_sign, (bypass_expzero?8'b0:exp_bits), rounded[12:0]};
     else if ((exp_bits == 8'hff) ||
              ((exp_bits == 8'hfe) && rounded[14]))
       pack_positive_bf22 = {1'b0,8'hfe,13'h1fff};
@@ -185,7 +178,8 @@ endfunction
 always @(posedge clk) begin
     if (op_valid) begin
       bypass_pre <= align_bypass;
-      bypass_value_pre <= align_bypass_value;
+      bypass_sign_pre <= align_bypass_sign;
+      bypass_expzero_pre <= align_bypass_expzero;
       large_exp_pre <= align_large_exp;
       large_sig_pre <= align_large_sig;
       shift_pre <= align_shift;
@@ -193,26 +187,29 @@ always @(posedge clk) begin
     end
     if (valid_pre) begin
       bypass_d0 <= bypass_pre;
-      bypass_value_d0 <= bypass_value_pre;
+      bypass_sign_d0 <= bypass_sign_pre;
+      bypass_expzero_d0 <= bypass_expzero_pre;
       large_exp_d0 <= large_exp_pre;
       large_sig_d0 <= large_sig_pre;
       small_sig_d0 <= align_small_sig;
     end
     if (valid_d0) begin
       bypass_d1 <= bypass_d0;
-      bypass_value_d1 <= bypass_value_d0;
+      bypass_sign_d1 <= bypass_sign_d0;
+      bypass_expzero_d1 <= bypass_expzero_d0;
       large_exp_d1 <= large_exp_d0;
       sum_d1 <= {1'b0,large_sig_d0} + {1'b0,small_sig_d0};
     end
     if (valid_d1) begin
       bypass_d2 <= bypass_d1;
-      bypass_value_d2 <= bypass_value_d1;
+      bypass_sign_d2 <= bypass_sign_d1;
+      bypass_expzero_d2 <= bypass_expzero_d1;
       norm_exp_d2 <= normalized_exp;
       norm_sig_d2 <= normalized_sig;
     end
     if (valid_d2)
       result_d3 <= pack_positive_bf22(
-          bypass_d2,bypass_value_d2,norm_exp_d2,rounded_value);
+          bypass_d2,bypass_sign_d2,bypass_expzero_d2,norm_exp_d2,rounded_value);
 end
 
 // Queue payload is meaningful only within partial_count_q. Reset/clear
