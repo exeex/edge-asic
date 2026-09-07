@@ -1,8 +1,8 @@
 `timescale 1ns/1ps
 
-// Positive-only BF22 softmax reduction. Four independent partial sums break
-// the streaming recurrence around a four-stage adder. After the last input
-// returns, the same adder drains the four-entry fall-through pipe to one sum.
+// Positive-only BF22 softmax reduction. Five independent partial sums break
+// the streaming recurrence around a five-stage adder. After the last input
+// returns, the same adder drains the five-entry fall-through pipe to one sum.
 module edge_actu_softmax_rsum (
   input  wire        clk,
   input  wire        cpurst_b,
@@ -15,7 +15,7 @@ module edge_actu_softmax_rsum (
   output reg  [21:0] out_sum_bf22_o
 );
 
-reg [21:0] partial_q [0:3];
+reg [21:0] partial_q [0:4];
 reg [2:0]  partial_count_q;
 reg [2:0]  fill_count_q;
 reg        drain_pending_q;
@@ -24,6 +24,14 @@ reg        drain_wait_q;
 reg        valid_d0, valid_d1, valid_d2, valid_d3;
 reg        last_d0, last_d1, last_d2, last_d3;
 reg        drain_d0, drain_d1, drain_d2, drain_d3;
+
+// Prepare exponent difference before the variable alignment shifter.
+reg valid_pre, last_pre, drain_pre;
+reg bypass_pre;
+reg [21:0] bypass_value_pre;
+reg [7:0] large_exp_pre, shift_pre;
+reg [18:0] large_sig_pre;
+reg [13:0] small_mant_pre;
 
 reg        bypass_d0;
 reg [21:0] bypass_value_d0;
@@ -46,13 +54,15 @@ reg [21:0] result_d3;
 wire [21:0] partial_head =
     (partial_count_q == 3'd1) ? partial_q[0] :
     (partial_count_q == 3'd2) ? partial_q[1] :
-    (partial_count_q == 3'd3) ? partial_q[2] : partial_q[3];
+    (partial_count_q == 3'd3) ? partial_q[2] :
+    (partial_count_q == 3'd4) ? partial_q[3] : partial_q[4];
 wire [21:0] partial_second =
     (partial_count_q == 3'd2) ? partial_q[0] :
-    (partial_count_q == 3'd3) ? partial_q[1] : partial_q[2];
+    (partial_count_q == 3'd3) ? partial_q[1] :
+    (partial_count_q == 3'd4) ? partial_q[2] : partial_q[3];
 
 wire pipe_push = valid_d3;
-wire stream_pop = in_valid_i && (fill_count_q >= 3'd4);
+wire stream_pop = in_valid_i && (fill_count_q >= 3'd5);
 wire drain_launch = drain_pending_q && !drain_wait_q &&
                     (partial_count_q >= 3'd2);
 wire drain_single = drain_pending_q && !drain_wait_q &&
@@ -62,7 +72,7 @@ wire [21:0] stream_feedback = (partial_count_q != 0) ?
 wire op_valid = in_valid_i || drain_launch;
 wire [21:0] op_a = drain_launch ? partial_head : in_bf22_i;
 wire [21:0] op_b = drain_launch ? partial_second :
-                       ((fill_count_q < 3'd4) ? 22'b0 : stream_feedback);
+                       ((fill_count_q < 3'd5) ? 22'b0 : stream_feedback);
 
 reg        align_bypass;
 reg [21:0] align_bypass_value;
@@ -91,8 +101,6 @@ always @* begin
   align_large_exp = 8'b0;
   align_small_exp = 8'b0;
   align_large_sig = 19'b0;
-  align_small_sig = 19'b0;
-  align_sticky = 1'b0;
   align_shift = 0;
   align_small_mant = 14'b0;
   if (align_a_sig == 0) begin
@@ -116,14 +124,21 @@ always @* begin
       align_small_mant = align_b_sig;
     end
     align_shift = align_large_exp - align_small_exp;
-    if (align_shift >= 19)
-      align_small_sig = {18'b0,|align_small_mant};
-    else if (align_shift == 0)
-      align_small_sig = {align_small_mant,5'b0};
+  end
+end
+
+always @* begin
+  align_sticky = 1'b0;
+  align_small_sig = 19'b0;
+  if (!bypass_pre) begin
+    if (shift_pre >= 19)
+      align_small_sig = {18'b0,|small_mant_pre};
+    else if (shift_pre == 0)
+      align_small_sig = {small_mant_pre,5'b0};
     else begin
-      align_sticky = |({align_small_mant,5'b0} &
-                       ((19'b1 << align_shift) - 19'b1));
-      align_small_sig = ({align_small_mant,5'b0} >> align_shift) |
+      align_sticky = |({small_mant_pre,5'b0} &
+                       ((19'b1 << shift_pre) - 19'b1));
+      align_small_sig = ({small_mant_pre,5'b0} >> shift_pre) |
                         {18'b0,align_sticky};
     end
   end
@@ -169,10 +184,18 @@ endfunction
 // Preserve result holding between valid operations for the feedback bypass.
 always @(posedge clk) begin
     if (op_valid) begin
-      bypass_d0 <= align_bypass;
-      bypass_value_d0 <= align_bypass_value;
-      large_exp_d0 <= align_large_exp;
-      large_sig_d0 <= align_large_sig;
+      bypass_pre <= align_bypass;
+      bypass_value_pre <= align_bypass_value;
+      large_exp_pre <= align_large_exp;
+      large_sig_pre <= align_large_sig;
+      shift_pre <= align_shift;
+      small_mant_pre <= align_small_mant;
+    end
+    if (valid_pre) begin
+      bypass_d0 <= bypass_pre;
+      bypass_value_d0 <= bypass_value_pre;
+      large_exp_d0 <= large_exp_pre;
+      large_sig_d0 <= large_sig_pre;
       small_sig_d0 <= align_small_sig;
     end
     if (valid_d0) begin
@@ -192,7 +215,18 @@ always @(posedge clk) begin
           bypass_d2,bypass_value_d2,norm_exp_d2,rounded_value);
 end
 
-integer slot;
+// Queue payload is meaningful only within partial_count_q. Reset/clear
+// empty the queue by resetting its count; refill overwrites valid entries.
+always @(posedge clk) begin
+  if (pipe_push) begin
+    partial_q[0] <= result_d3;
+    partial_q[1] <= partial_q[0];
+    partial_q[2] <= partial_q[1];
+    partial_q[3] <= partial_q[2];
+    partial_q[4] <= partial_q[3];
+  end
+end
+
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
     partial_count_q <= 3'b0;
@@ -202,14 +236,13 @@ always @(posedge clk or negedge cpurst_b) begin
     out_valid_o <= 1'b0;
     out_done_o <= 1'b0;
     out_sum_bf22_o <= 22'b0;
+    valid_pre <= 1'b0; last_pre <= 1'b0; drain_pre <= 1'b0;
     valid_d0 <= 1'b0; valid_d1 <= 1'b0;
     valid_d2 <= 1'b0; valid_d3 <= 1'b0;
     last_d0 <= 1'b0; last_d1 <= 1'b0;
     last_d2 <= 1'b0; last_d3 <= 1'b0;
     drain_d0 <= 1'b0; drain_d1 <= 1'b0;
     drain_d2 <= 1'b0; drain_d3 <= 1'b0;
-    for (slot = 0; slot < 4; slot = slot + 1)
-      partial_q[slot] <= 22'b0;
   end else if (clear_i) begin
     partial_count_q <= 3'b0;
     fill_count_q <= 3'b0;
@@ -218,20 +251,22 @@ always @(posedge clk or negedge cpurst_b) begin
     out_valid_o <= 1'b0;
     out_done_o <= 1'b0;
     out_sum_bf22_o <= 22'b0;
+    valid_pre <= 1'b0; last_pre <= 1'b0; drain_pre <= 1'b0;
     valid_d0 <= 1'b0; valid_d1 <= 1'b0;
     valid_d2 <= 1'b0; valid_d3 <= 1'b0;
     last_d0 <= 1'b0; last_d1 <= 1'b0;
     last_d2 <= 1'b0; last_d3 <= 1'b0;
     drain_d0 <= 1'b0; drain_d1 <= 1'b0;
     drain_d2 <= 1'b0; drain_d3 <= 1'b0;
-    for (slot = 0; slot < 4; slot = slot + 1)
-      partial_q[slot] <= 22'b0;
   end else begin
     out_valid_o <= 1'b0;
 
-    valid_d0 <= op_valid;
-    last_d0 <= in_valid_i && in_last_i;
-    drain_d0 <= drain_launch;
+    valid_pre <= op_valid;
+    last_pre <= in_valid_i && in_last_i;
+    drain_pre <= drain_launch;
+    valid_d0 <= valid_pre;
+    last_d0 <= last_pre;
+    drain_d0 <= drain_pre;
 
     valid_d1 <= valid_d0;
     last_d1 <= last_d0;
@@ -245,14 +280,10 @@ always @(posedge clk or negedge cpurst_b) begin
     last_d3 <= last_d2;
     drain_d3 <= drain_d2;
 
-    if (in_valid_i && fill_count_q < 3'd4)
+    if (in_valid_i && fill_count_q < 3'd5)
       fill_count_q <= fill_count_q + 1'b1;
 
     if (pipe_push) begin
-      partial_q[0] <= result_d3;
-      partial_q[1] <= partial_q[0];
-      partial_q[2] <= partial_q[1];
-      partial_q[3] <= partial_q[2];
       if (last_d3)
         drain_pending_q <= 1'b1;
       if (drain_d3)
@@ -283,12 +314,10 @@ end
 `ifndef SYNTHESIS
 always @(posedge clk) begin
   if (cpurst_b && !clear_i && in_valid_i && drain_pending_q) begin
-    $display("ACTU softmax RSUM accepted input during drain");
-    $finish;
+    $fatal(1,"ACTU softmax RSUM accepted input during drain");
   end
-  if (cpurst_b && !clear_i && partial_count_q > 4) begin
-    $display("ACTU softmax RSUM partial pipe overflow");
-    $finish;
+  if (cpurst_b && !clear_i && partial_count_q > 5) begin
+    $fatal(1,"ACTU softmax RSUM partial pipe overflow");
   end
 end
 `endif
