@@ -3,7 +3,7 @@
 // West-side ACTU frontend. EXP and the fused native-BF22 numerator /
 // denominator transform stay behind a registered physical boundary.
 (* keep_hierarchy = "yes" *)
-module edge_actu_exp_frontend (
+module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0) (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
@@ -38,12 +38,12 @@ reg [2:0] payload_class_s0, payload_class_s1, payload_class_s2;
 reg [2:0] scalar_class_s0, scalar_class_s1, scalar_class_s2;
 reg [2:0] den_class_s2, add_class_s2;
 edge_actu_bf22_classify classify_exp(exp_lut_bf22,exp_class);
-edge_actu_bf22_classify classify_input({in_value_bf16,6'b0},input_class);
-edge_actu_bf22_classify classify_scalar(in_scalar_bf22,scalar_class);
+edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_input({in_value_bf16,6'b0},input_class);
+edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_scalar(in_scalar_bf22,scalar_class);
 // The 1+e pack always emits exponent 127..129, including arbitrary raw bits.
 assign den_class=3'd0;
 wire [2:0] add_candidate_class;
-edge_actu_bf22_classify classify_add(bypass_add_bf22_s2,add_candidate_class);
+edge_actu_bf22_classify #(.FINITE_INPUTS(1)) classify_add(bypass_add_bf22_s2,add_candidate_class);
 assign add_class=(bypass_add_raw_s1_q==0)?3'd1:add_candidate_class;
 assign numerator_class=(tanh_num_raw_s2==0)?3'd1:3'd0;
 
@@ -388,9 +388,11 @@ always @(posedge clk) begin
       out_divisor_bf22 <= value_bf22_s2;
     else if (mode_s2 == EDGE_ACTU_MODE_RSQRT)
       // RSQRT's architectural domain is non-negative. Preserve a negative
-      // source so the shared backend returns its invalid/zero result instead
+      // source for standalone callers. Integrated entry policy overrides negative
+      // inputs, allowing unconditional x+epsilon with no wide bypass mux.
+      // The standalone shared backend returns its invalid/zero result instead
       // of interpreting the magnitude as a positive operand.
-      out_divisor_bf22 <= value_bf22_s2[21] ? value_bf22_s2 : bypass_add_s2;
+      out_divisor_bf22 <= (!FINITE_INPUTS && value_bf22_s2[21]) ? value_bf22_s2 : bypass_add_s2;
     else if (mode_s2 == EDGE_ACTU_MODE_SOFTMAX_NORMALIZE)
       out_divisor_bf22 <= scalar_bf22_s2;
     else
@@ -412,7 +414,7 @@ always @(posedge clk) begin
   out_payload_class<=payload_class_s2;
   if(mode_s2==EDGE_ACTU_MODE_RCP_ONLY)out_divisor_class<=payload_class_s2;
   else if(mode_s2==EDGE_ACTU_MODE_RSQRT)
-    out_divisor_class<=value_bf22_s2[21] ? payload_class_s2 : add_class_s2;
+    out_divisor_class<=(!FINITE_INPUTS && value_bf22_s2[21]) ? payload_class_s2 : add_class_s2;
   else if(mode_s2==EDGE_ACTU_MODE_SOFTMAX_NORMALIZE)out_divisor_class<=scalar_class_s2;
   else out_divisor_class<=den_class_s2;
   if(mode_s2==EDGE_ACTU_MODE_TANH)out_primary_class<=numerator_class;
@@ -424,10 +426,10 @@ endmodule
 
 // Sign-independent BF22 category. Exact zero-extension from BF16/BF19
 // preserves the category; reserved encodings are never emitted.
-module edge_actu_bf22_classify(input wire [21:0] value_bf22,output wire [2:0] value_class);
+module edge_actu_bf22_classify #(parameter FINITE_INPUTS=0)(input wire [21:0] value_bf22,output wire [2:0] value_class);
 wire exponent_zero=(value_bf22[20:13]==0);
 wire exponent_special=(&value_bf22[20:13]);
 wire fraction_zero=(value_bf22[12:0]==0);
 assign value_class=exponent_zero ? (fraction_zero ? 3'd1 : 3'd2) :
-                   exponent_special ? (fraction_zero ? 3'd4 : 3'd5) : 3'd0;
+                   (!FINITE_INPUTS && exponent_special) ? (fraction_zero ? 3'd4 : 3'd5) : 3'd0;
 endmodule

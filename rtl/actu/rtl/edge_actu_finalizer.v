@@ -35,6 +35,7 @@ edge_actu_finalizer_classified #(.POST_STAGES(POST_STAGES)) core (
  .clk(clk),.cpurst_b(cpurst_b),.in_valid(in_valid),.in_last(in_last),
  .in_mode(in_mode),.in_payload_bf19(in_payload_bf19),
  .in_primary_bf22(in_primary_bf22),.in_rcp_bf22(in_rcp_bf22),
+ .in_result_action(3'd0),
  .in_payload_class(classify({in_payload_bf19,3'b0})),
  .in_primary_class(classify(in_primary_bf22)),.in_rcp_class(classify(in_rcp_bf22)),
  .in_primary_operand(22'b0),.in_payload_operand(22'b0),.in_rcp_operand(22'b0),
@@ -51,6 +52,9 @@ endmodule
 // selection, softmax accumulation, and output pipeline state.
 (* keep_hierarchy = "yes" *)
 module edge_actu_finalizer_classified #(
+  parameter INPUT_POLICY = 0,
+  parameter FINITE_INPUTS = 0,
+  parameter EXTERNAL_RSUM = 0,
   parameter PREPARED_INPUTS = 0,
   parameter POST_STAGES = 6
 ) (
@@ -62,6 +66,7 @@ module edge_actu_finalizer_classified #(
   input  wire [18:0] in_payload_bf19,
   input  wire [21:0] in_primary_bf22,
   input  wire [21:0] in_rcp_bf22,
+  input  wire [2:0]  in_result_action,
   input  wire [2:0]  in_primary_class, in_payload_class, in_rcp_class,
   input wire [21:0] in_primary_operand, in_payload_operand, in_rcp_operand,
   input  wire        in_sum_clear,
@@ -278,8 +283,8 @@ assign mul1_sig_b=relay_rcp_operand[13:0];
 assign mul1_sign = mul1_lhs_bf22[21] ^ relay_rcp_bf22_q[21];
 assign mul1_zero = (lhs1_class == 3'd1) ||
                    (relay_rcp_class == 3'd1);
-assign mul1_special = special_class(lhs1_class) ||
-                      special_class(relay_rcp_class);
+assign mul1_special = !FINITE_INPUTS && (special_class(lhs1_class) ||
+                      special_class(relay_rcp_class));
 assign mul1_exp=$signed({4'b0,lhs1_operand[21:14]})+
                 $signed({4'b0,relay_rcp_operand[21:14]})-12'sd254;
 // Preserve M1 as a physical leaf so full-ACTU APR can cluster this multiplier
@@ -306,8 +311,8 @@ assign mul3_sig_b={1'b1,mul2_product_bf22_q[12:0]};
 assign mul3_sign = mul3_lhs_bf22[21] ^ mul2_product_bf22_q[21];
 assign mul3_zero = (mul2_payload_class == 3'd1) ||
                    (mul2_product_class == 3'd1);
-assign mul3_special = special_class(mul2_payload_class) ||
-                      special_class(mul2_product_class);
+assign mul3_special = !FINITE_INPUTS && (special_class(mul2_payload_class) ||
+                      special_class(mul2_product_class));
 assign mul3_exp=$signed({4'b0,mul2_payload_operand[21:14]})+
                 $signed({4'b0,mul2_product_bf22_q[20:13]})-12'sd254;
 edge_actu_mul14_comb #(.RESET_DATA(0)) x_mul3 (
@@ -334,8 +339,30 @@ wire [15:0] finite_result=bf22_to_bf16(final_result_bf22);
 wire [15:0] selected_result=(final_class==3'd1)?{final_result_bf22[21],15'b0}:
                            (final_class==3'd5)?16'h7fc0:
                            (final_class==3'd4)?{final_result_bf22[21],8'hff,7'b0}:finite_result;
-assign final_result_bits={selected_result,16'b0};
+// Entry semantics are resolved before the existing output capture, not after it.
+reg [2:0] result_action_q[0:5];
+integer result_action_stage;
+always @(posedge clk)begin
+ result_action_q[0]<=in_result_action;
+ for(result_action_stage=1;result_action_stage<6;result_action_stage=result_action_stage+1)
+  result_action_q[result_action_stage]<=result_action_q[result_action_stage-1];
+end
+function [15:0] action_bits;
+ input [2:0] action;
+ begin
+  case(action)
+   1:action_bits=16'h0000; 2:action_bits=16'h8000;
+   3:action_bits=16'h3f80; 4:action_bits=16'hbf80;
+   5:action_bits=16'h7f80; 6:action_bits=16'hff80;
+   default:action_bits=16'h7fc0;
+  endcase
+ end
+endfunction
+wire [15:0] policy_result=INPUT_POLICY && result_action_q[5]!=0 ?
+                         action_bits(result_action_q[5]) : selected_result;
+assign final_result_bits={policy_result,16'b0};
 
+generate if(!EXTERNAL_RSUM)begin: internal_rsum
 edge_actu_softmax_rsum x_softmax_rsum (
   .clk(clk),
   .cpurst_b(cpurst_b),
@@ -347,6 +374,9 @@ edge_actu_softmax_rsum x_softmax_rsum (
   .out_done_o(softmax_sum_done),
   .out_sum_bf22_o(softmax_sum_bf22)
 );
+end else begin: external_rsum
+ assign softmax_sum_valid=0;assign softmax_sum_done=0;assign softmax_sum_bf22=0;
+end endgenerate
 assign softmax_sum_value = {softmax_sum_bf22, 10'b0};
 
 // Reset cancels valid immediately. Mode travels with unreset data and is
@@ -443,13 +473,13 @@ always @(posedge clk) if(cpurst_b) begin
  // Primary and reciprocal ZERO can carry nonzero magnitude candidates. Standalone
  // raw callers remain checked exactly; integrated prepared callers use class.
  if(in_valid && (({in_primary_class,in_payload_class} !==
-   {(PREPARED_INPUTS && in_primary_class==3'd1 ? 3'd1 : observed_class(in_primary_bf22)),observed_class({in_payload_bf19,3'b0})}) ||
+   {(PREPARED_INPUTS && in_primary_class==3'd1 ? 3'd1 : observed_class(in_primary_bf22)),(FINITE_INPUTS && in_payload_bf19[17:10]==255 ? 3'd0 : observed_class({in_payload_bf19,3'b0}))}) ||
    ((!PREPARED_INPUTS || in_rcp_class!=3'd1) &&
     in_rcp_class !== observed_class(in_rcp_bf22))))
   $fatal(1,"finalizer input class mismatch");
- if(valid_pipe[2] && mul2_product_class==0 && observed_class(mul2_product_bf22_q)!=0)
+ if(!FINITE_INPUTS && valid_pipe[2] && mul2_product_class==0 && observed_class(mul2_product_bf22_q)!=0)
   $fatal(1,"finalizer M2 class mismatch");
- if(valid_pipe[4] && final_class==0 && observed_class(final_result_bf22)!=0)
+ if(!FINITE_INPUTS && valid_pipe[4] && final_class==0 && observed_class(final_result_bf22)!=0)
   $fatal(1,"finalizer output pack class mismatch");
 end
 `endif

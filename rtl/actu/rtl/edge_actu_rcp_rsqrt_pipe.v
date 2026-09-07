@@ -30,7 +30,7 @@ endmodule
 
 `timescale 1ns/1ps
 
-module edge_actu_rcp_rsqrt_classified_pipe (
+module edge_actu_rcp_rsqrt_classified_pipe #(parameter FINITE_INPUTS=0) (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
@@ -87,10 +87,12 @@ assign unbiased_exp = {2'b0, in_value_bf22[20:13]} - 10'sd127;
 assign exponent_odd = unbiased_exp[0];
 assign mant_q16 = {1'b0, 1'b1, in_value_bf22[12:0], 3'b0};
 assign norm_q16 = in_rsqrt && exponent_odd ? (mant_q16 << 1) : mant_q16;
-assign invalid_input = (in_value_class == 3'd1)
+// Integrated caller resolves input zero/Inf/NaN/domain cases at entry.
+// Only arithmetic underflow remains a numerical result observation.
+assign invalid_input = !FINITE_INPUTS && ((in_value_class == 3'd1)
                     || (in_value_class == 3'd4)
                     || (in_value_class == 3'd5)
-                    || (in_rsqrt && in_value_bf22[21]);
+                    || (in_rsqrt && in_value_bf22[21]));
 
 edge_actu_rcp_rsqrt_seed_q16 x_seed (
   .mant_idx(mant_idx),
