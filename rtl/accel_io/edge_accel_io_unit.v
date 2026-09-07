@@ -2,7 +2,7 @@
 
 module edge_accel_io_unit #(
   parameter ADDR_WIDTH = 16,
-  parameter ACTU_LATENCY = 26
+  parameter ACTU_LATENCY = 27
 ) (
   input wire clk, input wire cpurst_b,
   input wire start_valid, output wire start_ready,

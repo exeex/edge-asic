@@ -1,57 +1,30 @@
 `timescale 1ns/1ps
-
-// Native BF22 range reduction. Q16 truncates magnitude toward zero; the
-// signed log2 code floors only after multiplication, matching the EXP table.
-module edge_actu_exp_range_bf22 (
-  input wire [21:0] value_bf22,
-  output wire underflow,
-  output wire signed [9:0] exp2_k,
-  output wire [11:0] frac_code
-);
-wire sign_z;
-wire [22:0] magnitude_q16;
-edge_actu_exp_range_bf22_prepare x_prepare(value_bf22,underflow,sign_z,magnitude_q16);
-edge_actu_exp_range_bf22_scale x_scale(sign_z,magnitude_q16,exp2_k,frac_code);
+// Q12 magnitude, Q14 coefficient, Q12 LUT code. Sign stays separate.
+module edge_actu_exp_range_bf22(input [21:0] value_bf22,output underflow,output signed [9:0] exp2_k,output [11:0] frac_code);
+wire sign_z;wire [18:0] magnitude_q12;
+edge_actu_exp_range_bf22_prepare p(value_bf22,underflow,sign_z,magnitude_q12);
+edge_actu_exp_range_bf22_scale s(sign_z,magnitude_q12,exp2_k,frac_code);
+endmodule
+module edge_actu_exp_range_bf22_prepare(input [21:0] value_bf22,output underflow,sign_z,output [18:0] magnitude_q12);
+wire [7:0] exponent=value_bf22[20:13];
+wire [28:0] shifted={15'b0,1'b1,value_bf22[12:0]} << exponent[3:0];
+wire [18:0] finite_magnitude=exponent[7] ? shifted[18:0] : {6'b0,shifted[28:16]};
+assign sign_z=value_bf22[21];
+assign underflow=sign_z && value_bf22>=22'h30ab80;
+wire clamp_high=!sign_z && value_bf22[20:0]>=21'h10ac00;
+assign magnitude_q12=(underflow || exponent==255 || exponent<115) ? 19'b0 : clamp_high ? 19'd360448 : finite_magnitude;
+endmodule
+module edge_actu_exp_range_bf22_scale(input sign_z,input [18:0] magnitude_q12,output signed [9:0] exp2_k,output [11:0] frac_code);
+wire [33:0] product=magnitude_q12*15'd23637;
+wire negative_nonzero=sign_z && (|magnitude_q12);
+// Deliberate complement policy includes a one-code bias on exact Q12-grid products.
+assign exp2_k={2'b0,product[33:26]}^{10{negative_nonzero}};
+assign frac_code=product[25:14]^{12{negative_nonzero}};
 endmodule
 
-module edge_actu_exp_range_bf22_prepare (
-  input wire [21:0] value_bf22,
-  output wire underflow,
-  output wire sign_z,
-  output wire [22:0] magnitude_q16
-);
-wire [7:0] exponent = value_bf22[20:13];
-wire is_special = exponent == 8'hff;
-wire clamp_high = !sign_z && (value_bf22[20:0] >= 21'h10ac00);
-wire tiny = exponent < 8'd111; // abs(x) < 2^-16 cannot contribute to Q16.
-// For active exponents 111..133, Q16 = significand * 2^(exponent-124).
-// Shift only by the low four exponent bits; fixed slices supply the scale.
-wire [28:0] shifted = {15'b0,1'b1,value_bf22[12:0]} << exponent[3:0];
-wire [22:0] finite_magnitude = exponent[7] ? {shifted[18:0],4'b0} :
-                               exponent[4] ? {6'b0,shifted[28:12]} : 23'd1;
-assign sign_z = value_bf22[21];
-assign underflow = sign_z && (value_bf22 >= 22'h30ab80);
-assign magnitude_q16 = (underflow || is_special || tiny) ? 23'b0 :
-                       clamp_high ? 23'd5767168 : finite_magnitude;
-endmodule
-
-module edge_actu_exp_range_bf22_scale (
-  input wire sign_z,
-  input wire [22:0] magnitude_q16,
-  output wire signed [9:0] exp2_k,
-  output wire [11:0] frac_code
-);
-// magnitude <= 88*65536. Product needs 52 bits; signed code needs 20.
-wire [51:0] product = magnitude_q16 * 29'd387270501;
-wire [19:0] unsigned_code = product[51:32];
-wire [7:0] integer_part = unsigned_code[19:12];
-wire [11:0] fraction_code = unsigned_code[11:0];
-// An odd coefficient times a nonzero 23-bit magnitude cannot be divisible
-// by 2**32. Negative floor therefore complements both Q12 fields, even
-// when fraction_code is zero. Zero must keep exponent/index zero.
-wire negative_nonzero = sign_z && (|magnitude_q16);
-// The bounded magnitude makes integer_part <= 126. Sign extension plus
-// complement encodes -integer_part-1 without a carry-propagating adder.
-assign exp2_k = negative_nonzero ? ~{2'b00,integer_part} : {2'b00,integer_part};
-assign frac_code = negative_nonzero ? ~fraction_code : fraction_code;
+module edge_actu_exp_range_bf22_scale_parts(input negative_nonzero,input [15:0] low_q,input [23:0] high_q,output signed [9:0] exp2_k,output [11:0] frac_code);
+wire [24:0] combined={1'b0,high_q}+low_q;
+wire [19:0] code=combined[23:4];
+assign exp2_k={2'b0,code[19:12]}^{10{negative_nonzero}};
+assign frac_code=code[11:0]^{12{negative_nonzero}};
 endmodule

@@ -164,6 +164,34 @@ function [21:0] pack_positive_bf22;
   end
 endfunction
 
+// Arithmetic packets have no reset/clear dependency. Reset/clear cancel their
+// valid tags; accumulator state and externally visible outputs still reset.
+// Preserve result holding between valid operations for the feedback bypass.
+always @(posedge clk) begin
+    if (op_valid) begin
+      bypass_d0 <= align_bypass;
+      bypass_value_d0 <= align_bypass_value;
+      large_exp_d0 <= align_large_exp;
+      large_sig_d0 <= align_large_sig;
+      small_sig_d0 <= align_small_sig;
+    end
+    if (valid_d0) begin
+      bypass_d1 <= bypass_d0;
+      bypass_value_d1 <= bypass_value_d0;
+      large_exp_d1 <= large_exp_d0;
+      sum_d1 <= {1'b0,large_sig_d0} + {1'b0,small_sig_d0};
+    end
+    if (valid_d1) begin
+      bypass_d2 <= bypass_d1;
+      bypass_value_d2 <= bypass_value_d1;
+      norm_exp_d2 <= normalized_exp;
+      norm_sig_d2 <= normalized_sig;
+    end
+    if (valid_d2)
+      result_d3 <= pack_positive_bf22(
+          bypass_d2,bypass_value_d2,norm_exp_d2,rounded_value);
+end
+
 integer slot;
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
@@ -180,13 +208,6 @@ always @(posedge clk or negedge cpurst_b) begin
     last_d2 <= 1'b0; last_d3 <= 1'b0;
     drain_d0 <= 1'b0; drain_d1 <= 1'b0;
     drain_d2 <= 1'b0; drain_d3 <= 1'b0;
-    bypass_d0 <= 1'b0; bypass_value_d0 <= 22'b0;
-    large_exp_d0 <= 8'b0; large_sig_d0 <= 19'b0; small_sig_d0 <= 19'b0;
-    bypass_d1 <= 1'b0; bypass_value_d1 <= 22'b0;
-    large_exp_d1 <= 8'b0; sum_d1 <= 20'b0;
-    bypass_d2 <= 1'b0; bypass_value_d2 <= 22'b0;
-    norm_exp_d2 <= 8'b0; norm_sig_d2 <= 19'b0;
-    result_d3 <= 22'b0;
     for (slot = 0; slot < 4; slot = slot + 1)
       partial_q[slot] <= 22'b0;
   end else if (clear_i) begin
@@ -211,40 +232,18 @@ always @(posedge clk or negedge cpurst_b) begin
     valid_d0 <= op_valid;
     last_d0 <= in_valid_i && in_last_i;
     drain_d0 <= drain_launch;
-    if (op_valid) begin
-      bypass_d0 <= align_bypass;
-      bypass_value_d0 <= align_bypass_value;
-      large_exp_d0 <= align_large_exp;
-      large_sig_d0 <= align_large_sig;
-      small_sig_d0 <= align_small_sig;
-    end
 
     valid_d1 <= valid_d0;
     last_d1 <= last_d0;
     drain_d1 <= drain_d0;
-    if (valid_d0) begin
-      bypass_d1 <= bypass_d0;
-      bypass_value_d1 <= bypass_value_d0;
-      large_exp_d1 <= large_exp_d0;
-      sum_d1 <= {1'b0,large_sig_d0} + {1'b0,small_sig_d0};
-    end
 
     valid_d2 <= valid_d1;
     last_d2 <= last_d1;
     drain_d2 <= drain_d1;
-    if (valid_d1) begin
-      bypass_d2 <= bypass_d1;
-      bypass_value_d2 <= bypass_value_d1;
-      norm_exp_d2 <= normalized_exp;
-      norm_sig_d2 <= normalized_sig;
-    end
 
     valid_d3 <= valid_d2;
     last_d3 <= last_d2;
     drain_d3 <= drain_d2;
-    if (valid_d2)
-      result_d3 <= pack_positive_bf22(
-          bypass_d2,bypass_value_d2,norm_exp_d2,rounded_value);
 
     if (in_valid_i && fill_count_q < 3'd4)
       fill_count_q <= fill_count_q + 1'b1;

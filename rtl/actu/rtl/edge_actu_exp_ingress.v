@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-// Six captures: BF16 subtract decode/align/add/pack, Q16 prepare, scale.
+// Seven captures: BF16 subtract decode/coarse/fine/add/pack, Q12 prepare, scale.
 // Every mode and sideband takes the same path; scalar epsilon is BF16, while the retained sum is BF22.
 module edge_actu_exp_ingress (
   input wire clk, cpurst_b, in_valid, in_last, in_sum_clear,
@@ -17,14 +17,15 @@ module edge_actu_exp_ingress (
 );
 wire [15:0] delta_bf16;
 wire delta_valid;
-reg [21:0] native_operand_q [0:3];
-reg [22:0] magnitude_q16_q;
+reg [21:0] native_operand_q [0:4];
+reg [15:0] range_low_q;
+reg [23:0] range_high_q;
 reg sign_q, underflow_q;
-reg [4:0] valid_q;
-reg [2:0] mode_q [0:4];
-reg [15:0] value_q [0:4];
-reg [21:0] scalar_q [0:4];
-reg [4:0] last_q, clear_q;
+reg [5:0] valid_q;
+reg [2:0] mode_q [0:5];
+reg [15:0] value_q [0:5];
+reg [21:0] scalar_q [0:5];
+reg [5:0] last_q, clear_q;
 integer stage;
 function [21:0] native_exp_operand;
   input [15:0] value;
@@ -40,48 +41,51 @@ function [21:0] native_exp_operand;
     else native_exp_operand={value,6'b0};
   end
 endfunction
-// G0..G3: one dedicated capture per subtract operation, single BF16 RNE.
+// G0..G4: one dedicated capture per subtract operation, single BF16 RNE.
 edge_actu_softmax_sub_bf16_pipe x_subtract (
   .clk(clk),.cpurst_b(cpurst_b),.in_valid(in_valid),
   .value_bf16(in_value_bf16),.max_bf16(in_scalar_bits[31:16]),
   .out_valid(delta_valid),.delta_bf16(delta_bf16)
 );
 wire range_underflow, range_sign;
-wire [22:0] range_magnitude;
+wire [18:0] range_magnitude;
 wire signed [9:0] range_k;
 wire [11:0] range_frac;
-// G4 selects the BF16-rounded difference and captures bounded Q16.
+// G5 selects/prepares Q12 and computes both constant partial products in parallel.
 edge_actu_exp_range_bf22_prepare x_range_prepare (
-  .value_bf22(mode_q[3]==3'd5 ? {delta_bf16,6'b0} : native_operand_q[3]),
-  .underflow(range_underflow),.sign_z(range_sign),.magnitude_q16(range_magnitude)
+  .value_bf22(mode_q[4]==3'd5 ? {delta_bf16,6'b0} : native_operand_q[4]),
+  .underflow(range_underflow),.sign_z(range_sign),.magnitude_q12(range_magnitude)
 );
-// G5 has only registered fixed-point inputs: no mode mux or FP decode here.
-edge_actu_exp_range_bf22_scale x_range_scale (
-  .sign_z(sign_q),.magnitude_q16(magnitude_q16_q),
+// 23637 = 85 + (23 << 10). Low ten product bits cannot carry into bit ten.
+wire [25:0] range_low=range_magnitude*7'd85;
+wire [23:0] range_high=range_magnitude*5'd23;
+// G6 combines truncated partial products and applies the separate sign.
+edge_actu_exp_range_bf22_scale_parts x_range_scale (
+  .negative_nonzero(sign_q),.low_q(range_low_q),.high_q(range_high_q),
   .exp2_k(range_k),.frac_code(range_frac)
 );
 always @(posedge clk) begin
   native_operand_q[0]<=native_exp_operand(in_value_bf16,in_mode);
-  for(stage=1;stage<4;stage=stage+1)native_operand_q[stage]<=native_operand_q[stage-1];
-  magnitude_q16_q<=range_magnitude; sign_q<=range_sign; underflow_q<=range_underflow;
+  for(stage=1;stage<5;stage=stage+1)native_operand_q[stage]<=native_operand_q[stage-1];
+  range_low_q<=range_low[25:10]; range_high_q<=range_high; sign_q<=range_sign && (|range_magnitude); underflow_q<=range_underflow;
   mode_q[0]<=in_mode;
   value_q[0]<=in_value_bf16;
   // Only normalize carries an internal BF22 sum. External max/epsilon are BF16.
   scalar_q[0]<=(in_mode==3'd7) ? in_scalar_bits[31:10] : {in_scalar_bits[31:16],6'b0};
-  for(stage=1;stage<5;stage=stage+1)begin
+  for(stage=1;stage<6;stage=stage+1)begin
     mode_q[stage]<=mode_q[stage-1];value_q[stage]<=value_q[stage-1];scalar_q[stage]<=scalar_q[stage-1];
   end
-  out_mode<=mode_q[4]; out_value_bf16<=value_q[4];
-  out_scalar_bf22<=scalar_q[4];
+  out_mode<=mode_q[5]; out_value_bf16<=value_q[5];
+  out_scalar_bf22<=scalar_q[5];
   out_underflow<=underflow_q; out_exp2_k<=range_k; out_frac_code<=range_frac;
 end
 always @(posedge clk or negedge cpurst_b)
   if (!cpurst_b) begin
     out_valid<=1'b0; valid_q<=0; last_q<=0; clear_q<=0; out_last<=0; out_sum_clear<=0;
   end else begin
-    valid_q<={valid_q[3:0],in_valid};
-    out_valid<=valid_q[4];
-    last_q<={last_q[3:0],in_last}; clear_q<={clear_q[3:0],in_sum_clear};
-    out_last<=last_q[4]; out_sum_clear<=clear_q[4];
+    valid_q<={valid_q[4:0],in_valid};
+    out_valid<=valid_q[5];
+    last_q<={last_q[4:0],in_last}; clear_q<={clear_q[4:0],in_sum_clear};
+    out_last<=last_q[5]; out_sum_clear<=clear_q[5];
   end
 endmodule

@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module edge_actu #(
-  parameter PIPE_STAGES = 26
+  parameter PIPE_STAGES = 27
 ) (
   input  wire        forever_cpuclk,
   input  wire        cpurst_b,
@@ -30,7 +30,7 @@ localparam [2:0] EDGE_ACTU_MODE_TANH     = 3'd4;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX  = 3'd5;
 localparam [2:0] EDGE_ACTU_MODE_RSQRT    = 3'd6;
 localparam [2:0] EDGE_ACTU_MODE_SOFTMAX_NORMALIZE = 3'd7;
-localparam integer INGRESS_LATENCY = 6;
+localparam integer INGRESS_LATENCY = 7;
 localparam integer NONLINEAR_LATENCY = 7;
 localparam integer TRANSPORT_LATENCY = 6;
 localparam integer BACKEND_EGRESS_LATENCY = 1;
@@ -61,7 +61,7 @@ wire        finalizer_sum_done;
 wire [31:0] finalizer_sum_value;
 
 `ifndef SYNTHESIS
-initial if (PIPE_STAGES < 26) $fatal(1,"ACTU PIPE_STAGES must be at least 26");
+initial if (PIPE_STAGES < 27) $fatal(1,"ACTU PIPE_STAGES must be at least 27");
 `endif
 assign in_ready = cpurst_b;
 assign input_fire = in_valid && in_ready;
