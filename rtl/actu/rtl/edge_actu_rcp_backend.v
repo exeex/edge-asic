@@ -15,6 +15,7 @@ module edge_actu_rcp_backend #(
   input  wire [18:0] in_payload_bf19,
   input  wire [21:0] in_primary_bf22,
   input  wire [21:0] in_divisor_bf22,
+  input  wire [2:0]  in_primary_class, in_divisor_class, in_payload_class,
   input  wire        in_sum_clear,
   output wire        out_valid,
   output wire        out_last,
@@ -22,6 +23,8 @@ module edge_actu_rcp_backend #(
   output wire [18:0] out_payload_bf19,
   output wire [21:0] out_primary_bf22,
   output wire [21:0] out_rcp_bf22,
+  output wire [2:0]  out_primary_class, out_payload_class, out_rcp_class,
+  output reg [21:0] out_primary_operand,out_payload_operand,out_rcp_operand,
   output wire        out_sum_clear
 );
 
@@ -46,17 +49,38 @@ reg [18:0]  egress_payload_q;
 reg [21:0]  egress_primary_q;
 reg [21:0]  egress_rcp_q;
 reg         egress_sum_clear_q;
+reg [2:0] ingress_primary_class_q, ingress_divisor_class_q, ingress_payload_class_q;
+reg [2:0] primary_class_pipe [0:ALIGN_LATENCY-1];
+reg [2:0] payload_class_pipe [0:ALIGN_LATENCY-1];
+reg [2:0] egress_primary_class_q, egress_payload_class_q;
+assign out_primary_class=egress_primary_class_q;
+assign out_payload_class=egress_payload_class_q;
+function [21:0] prepare_operand;
+ input [21:0] b;input [2:0] c;
+ reg ez;
+ begin ez=(c==1)||(c==2);prepare_operand={ez?8'd1:b[20:13],!ez,b[12:0]};end
+endfunction
+always @(posedge clk)begin
+ out_primary_operand<=prepare_operand(primary_pipe[ALIGN_LATENCY-1],primary_class_pipe[ALIGN_LATENCY-1]);
+ out_payload_operand<=prepare_operand({payload_pipe[ALIGN_LATENCY-1],3'b0},payload_class_pipe[ALIGN_LATENCY-1]);
+ out_rcp_operand<=prepare_operand(nonlinear_bf22,nonlinear_class);
+end
 integer stage;
 
 wire nonlinear_valid;
 wire [21:0] nonlinear_bf22;
+wire [2:0] nonlinear_class;
+reg [2:0] egress_rcp_class_q;
+assign out_rcp_class=egress_rcp_class_q;
 
-edge_actu_rcp_rsqrt_pipe x_rcp_rsqrt (
+edge_actu_rcp_rsqrt_classified_pipe x_rcp_rsqrt (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .in_valid(ingress_valid_q),
   .in_rsqrt(ingress_mode_q == EDGE_ACTU_MODE_RSQRT),
   .in_value_bf22(ingress_divisor_q),
+  .in_value_class(ingress_divisor_class_q),
+  .out_value_class(nonlinear_class),
   .out_valid(nonlinear_valid),
   .out_value_bf22(nonlinear_bf22)
 );
@@ -108,5 +132,59 @@ always @(posedge clk) begin
       primary_pipe[data_stage] <= primary_pipe[data_stage - 1];
     end
 end
+
+integer class_stage;
+always @(posedge clk) begin
+  egress_rcp_class_q<=nonlinear_class;
+  ingress_primary_class_q<=in_primary_class;
+  ingress_divisor_class_q<=in_divisor_class;
+  ingress_payload_class_q<=in_payload_class;
+  primary_class_pipe[0]<=ingress_primary_class_q;
+  payload_class_pipe[0]<=ingress_payload_class_q;
+  for(class_stage=1;class_stage<ALIGN_LATENCY;class_stage=class_stage+1)begin
+    primary_class_pipe[class_stage]<=primary_class_pipe[class_stage-1];
+    payload_class_pipe[class_stage]<=payload_class_pipe[class_stage-1];
+  end
+  egress_primary_class_q<=primary_class_pipe[ALIGN_LATENCY-1];
+  egress_payload_class_q<=payload_class_pipe[ALIGN_LATENCY-1];
+end
+
+`ifndef SYNTHESIS
+// Independent observer: do not reuse the producer decoder in the checks.
+function [2:0] expected_class;
+  input [21:0] bits;
+  begin
+    expected_class=3'd0;
+    case(bits[20:13])
+      8'h00:expected_class=(|bits[12:0]) ? 3'd2 : 3'd1;
+      8'hff:expected_class=(|bits[12:0]) ? 3'd5 : 3'd4;
+      default:expected_class=3'd0;
+    endcase
+  end
+endfunction
+wire class_invalid=(ingress_divisor_class_q==3'd1)||
+                   (ingress_divisor_class_q==3'd4)||
+                   (ingress_divisor_class_q==3'd5)||
+                   ((ingress_mode_q==EDGE_ACTU_MODE_RSQRT)&&ingress_divisor_q[21]);
+always @(posedge clk) if(cpurst_b)begin
+  if(in_valid && ({in_primary_class,in_divisor_class,in_payload_class} !==
+    {expected_class(in_primary_bf22),expected_class(in_divisor_bf22),expected_class({in_payload_bf19,3'b0})}))
+    $fatal(1,"ACTU frontend class/data mismatch");
+  if(ingress_valid_q)begin
+    if({ingress_primary_class_q,ingress_divisor_class_q,ingress_payload_class_q} !==
+       {expected_class(ingress_primary_q),expected_class(ingress_divisor_q),expected_class({ingress_payload_q,3'b0})})
+      $fatal(1,"ACTU backend ingress class/data mismatch");
+    if(class_invalid !== ((ingress_divisor_q[20:0]==0) ||
+       (ingress_divisor_q[20:13]==8'hff) ||
+       ((ingress_mode_q==EDGE_ACTU_MODE_RSQRT)&&ingress_divisor_q[21])))
+      $fatal(1,"ACTU class-derived nonlinear case differs from existing decode");
+  end
+  if(out_valid && out_rcp_class !== expected_class(out_rcp_bf22))
+    $fatal(1,"ACTU reciprocal result class/data mismatch");
+  if(out_valid && ({out_primary_class,out_payload_class} !==
+     {expected_class(out_primary_bf22),expected_class({out_payload_bf19,3'b0})}))
+    $fatal(1,"ACTU backend egress class/data mismatch");
+end
+`endif
 
 endmodule

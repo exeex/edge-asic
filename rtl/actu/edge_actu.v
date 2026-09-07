@@ -48,6 +48,9 @@ wire [18:0] front_payload_bf19;
 wire [21:0] front_primary_bf22;
 wire [21:0] front_divisor_bf22;
 wire        front_sum_clear;
+wire [2:0] front_primary_class, front_divisor_class, front_payload_class;
+wire [2:0] aligned_primary_class, aligned_payload_class, aligned_rcp_class;
+wire [21:0] primary_operand,payload_operand,rcp_operand;
 wire        backend_sum_clear;
 wire        backend_last;
 wire [2:0]  aligned_mode;
@@ -105,7 +108,9 @@ edge_actu_exp_frontend x_exp_frontend (
   .out_payload_bf19(front_payload_bf19),
   .out_sum_clear(front_sum_clear),
   .out_primary_bf22(front_primary_bf22),
-  .out_divisor_bf22(front_divisor_bf22)
+  .out_divisor_bf22(front_divisor_bf22),
+  .out_primary_class(front_primary_class),.out_divisor_class(front_divisor_class),
+  .out_payload_class(front_payload_class)
 );
 
 edge_actu_rcp_backend #(.ALIGN_LATENCY(NONLINEAR_LATENCY)) x_rcp_backend (
@@ -117,6 +122,8 @@ edge_actu_rcp_backend #(.ALIGN_LATENCY(NONLINEAR_LATENCY)) x_rcp_backend (
   .in_payload_bf19(front_payload_bf19),
   .in_primary_bf22(front_primary_bf22),
   .in_divisor_bf22(front_divisor_bf22),
+  .in_primary_class(front_primary_class),.in_divisor_class(front_divisor_class),
+  .in_payload_class(front_payload_class),
   .in_sum_clear(front_sum_clear),
   .out_valid(nonlinear_out_valid),
   .out_last(backend_last),
@@ -124,10 +131,13 @@ edge_actu_rcp_backend #(.ALIGN_LATENCY(NONLINEAR_LATENCY)) x_rcp_backend (
   .out_payload_bf19(aligned_payload_bf19),
   .out_primary_bf22(aligned_primary_bf22),
   .out_rcp_bf22(nonlinear_out_bf22),
+  .out_primary_operand(primary_operand),.out_payload_operand(payload_operand),.out_rcp_operand(rcp_operand),
+  .out_rcp_class(aligned_rcp_class),
+  .out_primary_class(aligned_primary_class),.out_payload_class(aligned_payload_class),
   .out_sum_clear(backend_sum_clear)
 );
 
-edge_actu_finalizer #(.POST_STAGES(POST_STAGES)) x_finalizer (
+edge_actu_finalizer_classified #(.PREPARED_INPUTS(1),.POST_STAGES(POST_STAGES)) x_finalizer (
   .clk(forever_cpuclk),
   .cpurst_b(cpurst_b),
   .in_valid(nonlinear_out_valid),
@@ -136,6 +146,10 @@ edge_actu_finalizer #(.POST_STAGES(POST_STAGES)) x_finalizer (
   .in_payload_bf19(aligned_payload_bf19),
   .in_primary_bf22(aligned_primary_bf22),
   .in_rcp_bf22(nonlinear_out_bf22),
+  .in_primary_class(aligned_primary_class),
+  .in_payload_class(aligned_payload_class),
+  .in_rcp_class(aligned_rcp_class),
+  .in_primary_operand(primary_operand),.in_payload_operand(payload_operand),.in_rcp_operand(rcp_operand),
   .in_sum_clear(backend_sum_clear),
   .out_valid(finalizer_out_valid),
   .out_mode(finalizer_out_mode),

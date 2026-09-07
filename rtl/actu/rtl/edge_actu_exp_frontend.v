@@ -22,8 +22,27 @@ module edge_actu_exp_frontend (
   output reg  [18:0] out_payload_bf19,
   output reg         out_sum_clear,
   output reg  [21:0] out_primary_bf22,
+  output reg  [2:0]  out_primary_class,
+  output reg  [2:0]  out_divisor_class,
+  output reg  [2:0]  out_payload_class,
   output reg  [21:0] out_divisor_bf22
 );
+
+// Class encoding: normal=0, zero=1, subnormal=2, infinity=4, NaN=5.
+// Divisor class is consumed by the nonlinear core; primary/payload classes
+// travel to the finalizer. Arithmetic and special-case priorities are unchanged.
+wire [2:0] exp_class, input_class, scalar_class;
+wire [2:0] den_class, add_class, numerator_class;
+reg [2:0] exp_class_s0, exp_class_s1, exp_class_s2;
+reg [2:0] payload_class_s0, payload_class_s1, payload_class_s2;
+reg [2:0] scalar_class_s0, scalar_class_s1, scalar_class_s2;
+reg [2:0] den_class_s2, add_class_s2;
+edge_actu_bf22_classify classify_exp(exp_lut_bf22,exp_class);
+edge_actu_bf22_classify classify_input({in_value_bf16,6'b0},input_class);
+edge_actu_bf22_classify classify_scalar(in_scalar_bf22,scalar_class);
+edge_actu_bf22_classify classify_den(den_bf22_s2,den_class);
+edge_actu_bf22_classify classify_add(bypass_add_bf22_s2,add_class);
+edge_actu_bf22_classify classify_num(tanh_num_bf22_s3,numerator_class);
 
 localparam [2:0] EDGE_ACTU_MODE_RCP_ONLY = 3'd1;
 localparam [2:0] EDGE_ACTU_MODE_SIGMOID = 3'd2;
@@ -387,4 +406,31 @@ always @(posedge clk) begin
       out_primary_bf22 <= exp_s2;
 end
 
+// Numerical class is payload: reset/clear cancellation remains owned by valid.
+always @(posedge clk) begin
+  exp_class_s0<=exp_class;exp_class_s1<=exp_class_s0;exp_class_s2<=exp_class_s1;
+  payload_class_s0<=input_class;payload_class_s1<=payload_class_s0;payload_class_s2<=payload_class_s1;
+  scalar_class_s0<=scalar_class;scalar_class_s1<=scalar_class_s0;scalar_class_s2<=scalar_class_s1;
+  den_class_s2<=den_class;add_class_s2<=add_class;
+  out_payload_class<=payload_class_s2;
+  if(mode_s2==EDGE_ACTU_MODE_RCP_ONLY)out_divisor_class<=payload_class_s2;
+  else if(mode_s2==EDGE_ACTU_MODE_RSQRT)
+    out_divisor_class<=value_bf22_s2[21] ? payload_class_s2 : add_class_s2;
+  else if(mode_s2==EDGE_ACTU_MODE_SOFTMAX_NORMALIZE)out_divisor_class<=scalar_class_s2;
+  else out_divisor_class<=den_class_s2;
+  if(mode_s2==EDGE_ACTU_MODE_TANH)out_primary_class<=numerator_class;
+  else if(fused_sigmoid_s3)out_primary_class<=payload_bf19_s2[18] ? exp_class_s2 : 3'd0;
+  else out_primary_class<=exp_class_s2;
+end
+
+endmodule
+
+// Sign-independent BF22 category. Exact zero-extension from BF16/BF19
+// preserves the category; reserved encodings are never emitted.
+module edge_actu_bf22_classify(input wire [21:0] value_bf22,output wire [2:0] value_class);
+wire exponent_zero=(value_bf22[20:13]==0);
+wire exponent_special=(&value_bf22[20:13]);
+wire fraction_zero=(value_bf22[12:0]==0);
+assign value_class=exponent_zero ? (fraction_zero ? 3'd1 : 3'd2) :
+                   exponent_special ? (fraction_zero ? 3'd4 : 3'd5) : 3'd0;
 endmodule

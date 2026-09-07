@@ -10,6 +10,35 @@ module edge_actu_rcp_rsqrt_pipe (
   output wire [21:0] out_value_bf22
 );
 
+// Standalone raw-BF22 compatibility boundary. Integrated ACTU uses the
+// classified core directly, so it does not repeat this payload decode.
+wire [2:0] value_class;
+assign value_class = (in_value_bf22[20:13] == 0) ?
+                    ((|in_value_bf22[12:0]) ? 3'd2 : 3'd1) :
+                    (in_value_bf22[20:13] == 8'hff) ?
+                    ((|in_value_bf22[12:0]) ? 3'd5 : 3'd4) : 3'd0;
+edge_actu_rcp_rsqrt_classified_pipe core (
+  .clk(clk), .cpurst_b(cpurst_b), .in_valid(in_valid),
+  .in_rsqrt(in_rsqrt), .in_value_bf22(in_value_bf22),
+  .in_value_class(value_class), .out_valid(out_valid),
+  .out_value_bf22(out_value_bf22), .out_value_class()
+);
+endmodule
+
+`timescale 1ns/1ps
+
+module edge_actu_rcp_rsqrt_classified_pipe (
+  input  wire        clk,
+  input  wire        cpurst_b,
+  input  wire        in_valid,
+  input  wire        in_rsqrt,
+  input  wire [21:0] in_value_bf22,
+  input  wire [2:0]  in_value_class,
+  output wire [2:0]  out_value_class,
+  output wire        out_valid,
+  output wire [21:0] out_value_bf22
+);
+
 reg         valid_s0, valid_s1, valid_s2, valid_s3;
 reg         valid_s4, valid_s5, valid_s6;
 reg         rsqrt_s0, rsqrt_s1, rsqrt_s2, rsqrt_s3;
@@ -55,8 +84,9 @@ assign unbiased_exp = {2'b0, in_value_bf22[20:13]} - 10'sd127;
 assign exponent_odd = unbiased_exp[0];
 assign mant_q16 = {1'b0, 1'b1, in_value_bf22[12:0], 3'b0};
 assign norm_q16 = in_rsqrt && exponent_odd ? (mant_q16 << 1) : mant_q16;
-assign invalid_input = (in_value_bf22[20:0] == 21'b0)
-                    || (in_value_bf22[20:13] == 8'hff)
+assign invalid_input = (in_value_class == 3'd1)
+                    || (in_value_class == 3'd4)
+                    || (in_value_class == 3'd5)
                     || (in_rsqrt && in_value_bf22[21]);
 
 edge_actu_rcp_rsqrt_seed_q16 x_seed (
@@ -113,6 +143,9 @@ assign normalized_result = result_is_one ? result_s6 : (result_s6 << 1);
 assign result_exp = result_is_one ? scale_exp : (scale_exp - 11'sd1);
 assign biased_exp = result_exp + 12'sd127;
 assign result_fraction = normalized_result[15:3];
+// Packing emits only zero or normal: underflow/invalid flush to zero,
+// overflow saturates to max finite. Derive class from those same decisions.
+assign out_value_class = (invalid_s6 || biased_exp <= 0) ? 3'd1 : 3'd0;
 assign out_valid = valid_s6;
 assign out_value_bf22 = invalid_s6 ? 22'b0 :
                    (biased_exp <= 0 ? 22'b0 :
