@@ -40,9 +40,12 @@ reg [2:0] den_class_s2, add_class_s2;
 edge_actu_bf22_classify classify_exp(exp_lut_bf22,exp_class);
 edge_actu_bf22_classify classify_input({in_value_bf16,6'b0},input_class);
 edge_actu_bf22_classify classify_scalar(in_scalar_bf22,scalar_class);
-edge_actu_bf22_classify classify_den(den_bf22_s2,den_class);
-edge_actu_bf22_classify classify_add(bypass_add_bf22_s2,add_class);
-edge_actu_bf22_classify classify_num(tanh_num_bf22_s3,numerator_class);
+// The 1+e pack always emits exponent 127..129, including arbitrary raw bits.
+assign den_class=3'd0;
+wire [2:0] add_candidate_class;
+edge_actu_bf22_classify classify_add(bypass_add_bf22_s2,add_candidate_class);
+assign add_class=(bypass_add_raw_s1_q==0)?3'd1:add_candidate_class;
+assign numerator_class=(tanh_num_raw_s2==0)?3'd1:3'd0;
 
 localparam [2:0] EDGE_ACTU_MODE_RCP_ONLY = 3'd1;
 localparam [2:0] EDGE_ACTU_MODE_SIGMOID = 3'd2;
@@ -128,9 +131,7 @@ function [18:0] align_to_one_grs;
     exp_bits = e[20:13];
     sig = (exp_bits == 0) ? {1'b0, e[12:0]} : {1'b1, e[12:0]};
     ext = {sig, 5'b0};
-    if (sig == 0) begin
-      align_to_one_grs = 19'b0;
-    end else if (exp_bits >= 8'd127) begin
+    if (exp_bits >= 8'd127) begin
       align_to_one_grs = BF22_ONE_EXT;
     end else begin
       shift = {24'b0, 8'd127} - {24'b0, exp_bits};
@@ -204,9 +205,7 @@ function [21:0] pack_num_bf22;
   reg [14:0] rounded;
   reg [7:0] exp_bits;
   begin
-    if (raw == 0 || leading_zeros >= 5'd19) begin
-      pack_num_bf22 = 22'b0;
-    end else begin
+    begin // Unconditional numeric candidate; ZERO travels in numerator_class.
       norm = raw << leading_zeros;
       exp_bits = 8'd127 - {3'b0, leading_zeros};
       main = norm[18:5];
@@ -228,9 +227,7 @@ function [21:0] pack_positive_add_bf22;
   reg [13:0] main;
   reg [14:0] rounded;
   begin
-    if (raw == 0) begin
-      pack_positive_add_bf22 = 22'b0;
-    end else begin
+    begin // Unconditional numeric candidate; ZERO travels in add_class.
       if (raw[19]) begin
         exp_bits = base_exp + 1'b1;
         norm = {raw[19:2], |raw[1:0]};
@@ -310,8 +307,8 @@ edge_actu_exp2_pack_q28_bf22 x_exp_pack (
 assign exp_lut_bf22 = exp_underflow ? 22'b0 : exp_packed_bf22;
 assign aligned_e_s1 = align_to_one_grs(exp_s0);
 assign den_raw_s1 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1};
-assign tanh_num_raw_s1 = (aligned_e_s1 >= BF22_ONE_EXT) ? 19'b0 :
-                         (BF22_ONE_EXT - aligned_e_s1);
+// align_to_one_grs is proven <= ONE_EXT for all BF22 encodings.
+assign tanh_num_raw_s1 = BF22_ONE_EXT - aligned_e_s1;
 assign tanh_num_lzc_s2 = lzc19(tanh_num_raw_s1_q);
 assign den_bf22_s2 = pack_den_bf22(den_raw_s1_q);
 assign bypass_add_bf22_s2 = pack_positive_add_bf22(

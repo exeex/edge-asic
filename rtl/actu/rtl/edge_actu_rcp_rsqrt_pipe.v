@@ -12,7 +12,10 @@ module edge_actu_rcp_rsqrt_pipe (
 
 // Standalone raw-BF22 compatibility boundary. Integrated ACTU uses the
 // classified core directly, so it does not repeat this payload decode.
-wire [2:0] value_class;
+wire [2:0] value_class, result_class;
+wire [21:0] result_candidate;
+// Only the standalone raw boundary materializes the legacy positive zero.
+assign out_value_bf22=(result_class==3'd1)?22'b0:result_candidate;
 assign value_class = (in_value_bf22[20:13] == 0) ?
                     ((|in_value_bf22[12:0]) ? 3'd2 : 3'd1) :
                     (in_value_bf22[20:13] == 8'hff) ?
@@ -21,7 +24,7 @@ edge_actu_rcp_rsqrt_classified_pipe core (
   .clk(clk), .cpurst_b(cpurst_b), .in_valid(in_valid),
   .in_rsqrt(in_rsqrt), .in_value_bf22(in_value_bf22),
   .in_value_class(value_class), .out_valid(out_valid),
-  .out_value_bf22(out_value_bf22), .out_value_class()
+  .out_value_bf22(result_candidate), .out_value_class(result_class)
 );
 endmodule
 
@@ -143,14 +146,18 @@ assign normalized_result = result_is_one ? result_s6 : (result_s6 << 1);
 assign result_exp = result_is_one ? scale_exp : (scale_exp - 11'sd1);
 assign biased_exp = result_exp + 12'sd127;
 assign result_fraction = normalized_result[15:3];
-// Packing emits only zero or normal: underflow/invalid flush to zero,
-// overflow saturates to max finite. Derive class from those same decisions.
-assign out_value_class = (invalid_s6 || biased_exp <= 0) ? 3'd1 : 3'd0;
+// Class describes the semantic result, not the candidate encoding. Invalid
+// and underflow values travel as ZERO with don't-care magnitude; downstream
+// arithmetic must use the sideband, and only the final output materializes zero.
+wire result_zero=invalid_s6 || biased_exp <= 0;
+assign out_value_class = result_zero ? 3'd1 : 3'd0;
 assign out_valid = valid_s6;
-assign out_value_bf22 = invalid_s6 ? 22'b0 :
-                   (biased_exp <= 0 ? 22'b0 :
-                    (biased_exp >= 255 ? {sign_s6, 8'hfe, 13'h1fff} :
-                     {sign_s6, biased_exp[7:0], result_fraction}));
+// Keep the legacy positive-zero sign in the semantic sign bit. This one-bit
+// control never gates the exponent/fraction datapath. With the current
+// exponent preparation, biased_exp <= 254 (RCP) or <= 191 (RSQRT); the former
+// overflow-saturation branch is unreachable for every accepted BF22 input.
+wire result_sign=sign_s6 && !result_zero;
+assign out_value_bf22 = {result_sign,biased_exp[7:0],result_fraction};
 
 // Only validity is cancellation state. Numeric-domain flags are packet data.
 always @(posedge clk or negedge cpurst_b) begin

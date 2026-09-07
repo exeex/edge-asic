@@ -440,8 +440,12 @@ always @(posedge clk) if(cpurst_b) begin
       prepare_operand({in_payload_bf19,3'b0},in_payload_class),
       prepare_operand(in_rcp_bf22,in_rcp_class)}))
   $fatal(1,"finalizer prepared operand alignment mismatch");
- if(in_valid && ({in_primary_class,in_payload_class,in_rcp_class} !==
-   {observed_class(in_primary_bf22),observed_class({in_payload_bf19,3'b0}),observed_class(in_rcp_bf22)}))
+ // Primary and reciprocal ZERO can carry nonzero magnitude candidates. Standalone
+ // raw callers remain checked exactly; integrated prepared callers use class.
+ if(in_valid && (({in_primary_class,in_payload_class} !==
+   {(PREPARED_INPUTS && in_primary_class==3'd1 ? 3'd1 : observed_class(in_primary_bf22)),observed_class({in_payload_bf19,3'b0})}) ||
+   ((!PREPARED_INPUTS || in_rcp_class!=3'd1) &&
+    in_rcp_class !== observed_class(in_rcp_bf22))))
   $fatal(1,"finalizer input class mismatch");
  if(valid_pipe[2] && mul2_product_class==0 && observed_class(mul2_product_bf22_q)!=0)
   $fatal(1,"finalizer M2 class mismatch");
