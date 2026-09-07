@@ -69,57 +69,44 @@ assign out_primary_bf22 = egress_primary_q;
 assign out_rcp_bf22 = egress_rcp_q;
 assign out_sum_clear = egress_sum_clear_q;
 
+// Reset cancels valid and standalone control pulses, not payload/mode state.
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
-    ingress_valid_q <= 1'b0;
-    ingress_last_q <= 1'b0;
-    ingress_mode_q <= 3'b0;
-    ingress_payload_q <= 19'b0;
-    ingress_primary_q <= 22'b0;
-    ingress_divisor_q <= 22'b0;
-    ingress_sum_clear_q <= 1'b0;
-    egress_valid_q <= 1'b0;
-    egress_last_q <= 1'b0;
-    egress_mode_q <= 3'b0;
-    egress_payload_q <= 19'b0;
-    egress_primary_q <= 22'b0;
-    egress_rcp_q <= 22'b0;
-    egress_sum_clear_q <= 1'b0;
-    for (stage = 0; stage < ALIGN_LATENCY; stage = stage + 1) begin
-      mode_pipe[stage] <= 3'b0;
-      payload_pipe[stage] <= 19'b0;
-      primary_pipe[stage] <= 22'b0;
-      sum_clear_pipe[stage] <= 1'b0;
-      last_pipe[stage] <= 1'b0;
+    ingress_valid_q<=0; ingress_last_q<=0; ingress_sum_clear_q<=0;
+    egress_valid_q<=0; egress_last_q<=0; egress_sum_clear_q<=0;
+    for(stage=0;stage<ALIGN_LATENCY;stage=stage+1)begin
+      last_pipe[stage]<=0;sum_clear_pipe[stage]<=0;
     end
   end else begin
-    ingress_valid_q <= in_valid;
-    ingress_last_q <= in_last;
+    ingress_valid_q<=in_valid;ingress_last_q<=in_last;ingress_sum_clear_q<=in_sum_clear;
+    egress_valid_q<=nonlinear_valid;
+    egress_last_q<=last_pipe[ALIGN_LATENCY-1];
+    egress_sum_clear_q<=sum_clear_pipe[ALIGN_LATENCY-1];
+    last_pipe[0]<=ingress_last_q;sum_clear_pipe[0]<=ingress_sum_clear_q;
+    for(stage=1;stage<ALIGN_LATENCY;stage=stage+1)begin
+      last_pipe[stage]<=last_pipe[stage-1];sum_clear_pipe[stage]<=sum_clear_pipe[stage-1];
+    end
+  end
+end
+
+integer data_stage;
+always @(posedge clk) begin
     ingress_mode_q <= in_mode;
     ingress_payload_q <= in_payload_bf19;
     ingress_primary_q <= in_primary_bf22;
     ingress_divisor_q <= in_divisor_bf22;
-    ingress_sum_clear_q <= in_sum_clear;
-    egress_valid_q <= nonlinear_valid;
-    egress_last_q <= last_pipe[ALIGN_LATENCY-1];
     egress_mode_q <= mode_pipe[ALIGN_LATENCY-1];
     egress_payload_q <= payload_pipe[ALIGN_LATENCY-1];
     egress_primary_q <= primary_pipe[ALIGN_LATENCY-1];
     egress_rcp_q <= nonlinear_bf22;
-    egress_sum_clear_q <= sum_clear_pipe[ALIGN_LATENCY-1];
     mode_pipe[0] <= ingress_mode_q;
     payload_pipe[0] <= ingress_payload_q;
     primary_pipe[0] <= ingress_primary_q;
-    sum_clear_pipe[0] <= ingress_sum_clear_q;
-    last_pipe[0] <= ingress_last_q;
-    for (stage = 1; stage < ALIGN_LATENCY; stage = stage + 1) begin
-      mode_pipe[stage] <= mode_pipe[stage - 1];
-      payload_pipe[stage] <= payload_pipe[stage - 1];
-      primary_pipe[stage] <= primary_pipe[stage - 1];
-      sum_clear_pipe[stage] <= sum_clear_pipe[stage - 1];
-      last_pipe[stage] <= last_pipe[stage - 1];
+    for (data_stage = 1; data_stage < ALIGN_LATENCY; data_stage = data_stage + 1) begin
+      mode_pipe[data_stage] <= mode_pipe[data_stage - 1];
+      payload_pipe[data_stage] <= payload_pipe[data_stage - 1];
+      primary_pipe[data_stage] <= primary_pipe[data_stage - 1];
     end
-  end
 end
 
 endmodule

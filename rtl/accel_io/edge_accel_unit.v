@@ -2,7 +2,7 @@
 
 module edge_accel_unit #(
   parameter ADDR_WIDTH = 16,
-  parameter ACTU_PIPE_STAGES = 23
+  parameter ACTU_PIPE_STAGES = 26
 ) (
   input  wire                  clk,
   input  wire                  cpurst_b,

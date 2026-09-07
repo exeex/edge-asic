@@ -51,7 +51,7 @@ reg [2:0]   mode_s0;
 reg [18:0]  payload_bf19_s0;
 reg         sum_clear_s0;
 reg [21:0]  exp_s0;
-reg [21:0]  value_bf22_s0;
+wire [21:0] value_bf22_s0 = {payload_bf19_s0, 3'b0};
 reg [21:0]  scalar_bf22_s0;
 
 reg         valid_s1;
@@ -60,7 +60,7 @@ reg [2:0]   mode_s1;
 reg [18:0]  payload_bf19_s1;
 reg         sum_clear_s1;
 reg [21:0]  exp_s1;
-reg [21:0]  value_bf22_s1;
+wire [21:0] value_bf22_s1 = {payload_bf19_s1, 3'b0};
 reg [21:0]  scalar_bf22_s1;
 reg [19:0]  den_raw_s1_q;
 reg [18:0]  tanh_num_raw_s1_q;
@@ -73,7 +73,7 @@ reg [2:0]   mode_s2;
 reg [18:0]  payload_bf19_s2;
 reg         sum_clear_s2;
 reg [21:0]  exp_s2;
-reg [21:0]  value_bf22_s2;
+wire [21:0] value_bf22_s2 = {payload_bf19_s2, 3'b0};
 reg [21:0]  scalar_bf22_s2;
 reg [21:0]  den_s2;
 reg [21:0]  bypass_add_s2;
@@ -303,66 +303,51 @@ assign tanh_num_bf22_s3 = pack_num_bf22(tanh_num_raw_s2,
 assign fused_sigmoid_s3 = (mode_s2 == EDGE_ACTU_MODE_SIGMOID) ||
                            (mode_s2 == EDGE_ACTU_MODE_SILU);
 
+// Only packet validity and independently meaningful control pulses reset.
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
     valid_s0 <= 1'b0;
     last_s0 <= 1'b0;
-    mode_s0 <= 3'b0;
-    payload_bf19_s0 <= 19'b0;
     sum_clear_s0 <= 1'b0;
-    exp_s0 <= 22'b0;
-    value_bf22_s0 <= 22'b0;
-    scalar_bf22_s0 <= 22'b0;
     valid_s1 <= 1'b0;
     last_s1 <= 1'b0;
-    mode_s1 <= 3'b0;
-    payload_bf19_s1 <= 19'b0;
     sum_clear_s1 <= 1'b0;
-    exp_s1 <= 22'b0;
-    value_bf22_s1 <= 22'b0;
-    scalar_bf22_s1 <= 22'b0;
-    den_raw_s1_q <= 20'b0;
-    tanh_num_raw_s1_q <= 19'b0;
-    bypass_add_exp_s1_q <= 8'b0;
-    bypass_add_raw_s1_q <= 20'b0;
     valid_s2 <= 1'b0;
     last_s2 <= 1'b0;
-    mode_s2 <= 3'b0;
-    payload_bf19_s2 <= 19'b0;
     sum_clear_s2 <= 1'b0;
-    exp_s2 <= 22'b0;
-    value_bf22_s2 <= 22'b0;
-    scalar_bf22_s2 <= 22'b0;
-    den_s2 <= 22'b0;
-    bypass_add_s2 <= 22'b0;
-    tanh_num_raw_s2 <= 19'b0;
-    tanh_num_lzc_s2_q <= 5'b0;
     out_valid <= 1'b0;
     out_last <= 1'b0;
-    out_mode <= 3'b0;
-    out_payload_bf19 <= 19'b0;
     out_sum_clear <= 1'b0;
-    out_primary_bf22 <= 22'b0;
-    out_divisor_bf22 <= 22'b0;
   end else begin
-    // F0: EXP output boundary.
     valid_s0 <= in_valid;
     last_s0 <= in_last;
+    sum_clear_s0 <= in_sum_clear;
+    valid_s1 <= valid_s0;
+    last_s1 <= last_s0;
+    sum_clear_s1 <= sum_clear_s0;
+    valid_s2 <= valid_s1;
+    last_s2 <= last_s1;
+    sum_clear_s2 <= sum_clear_s1;
+    out_valid <= valid_s2;
+    out_last <= last_s2;
+    out_sum_clear <= sum_clear_s2;
+  end
+end
+
+// Feed-forward data and modes refill under the valid pipeline.
+always @(posedge clk) begin
+    // F0: EXP output boundary.
     mode_s0 <= in_mode;
     payload_bf19_s0 <= {in_value_bf16,3'b0};
-    sum_clear_s0 <= in_sum_clear;
     exp_s0 <= exp_lut_bf22;
-    value_bf22_s0 <= {in_value_bf16,6'b0};
+
     scalar_bf22_s0 <= in_scalar_bf22;
 
     // F1: shared alignment and parallel 1+e / 1-e raw arithmetic.
-    valid_s1 <= valid_s0;
-    last_s1 <= last_s0;
     mode_s1 <= mode_s0;
     payload_bf19_s1 <= payload_bf19_s0;
-    sum_clear_s1 <= sum_clear_s0;
     exp_s1 <= exp_s0;
-    value_bf22_s1 <= value_bf22_s0;
+
     scalar_bf22_s1 <= scalar_bf22_s0;
     den_raw_s1_q <= den_raw_s1;
     tanh_num_raw_s1_q <= tanh_num_raw_s1;
@@ -370,13 +355,10 @@ always @(posedge clk or negedge cpurst_b) begin
     bypass_add_raw_s1_q <= bypass_add_raw_s1;
 
     // F2: denominator pack and numerator leading-zero detection.
-    valid_s2 <= valid_s1;
-    last_s2 <= last_s1;
     mode_s2 <= mode_s1;
     payload_bf19_s2 <= payload_bf19_s1;
-    sum_clear_s2 <= sum_clear_s1;
     exp_s2 <= exp_s1;
-    value_bf22_s2 <= value_bf22_s1;
+
     scalar_bf22_s2 <= scalar_bf22_s1;
     den_s2 <= den_bf22_s2;
     bypass_add_s2 <= bypass_add_bf22_s2;
@@ -384,11 +366,8 @@ always @(posedge clk or negedge cpurst_b) begin
     tanh_num_lzc_s2_q <= tanh_num_lzc_s2;
 
     // F3: numerator normalize/pack and native-BF22 frontend packet.
-    out_valid <= valid_s2;
-    out_last <= last_s2;
     out_mode <= mode_s2;
     out_payload_bf19 <= payload_bf19_s2;
-    out_sum_clear <= sum_clear_s2;
     if (mode_s2 == EDGE_ACTU_MODE_RCP_ONLY)
       out_divisor_bf22 <= value_bf22_s2;
     else if (mode_s2 == EDGE_ACTU_MODE_RSQRT)
@@ -406,7 +385,6 @@ always @(posedge clk or negedge cpurst_b) begin
       out_primary_bf22 <= payload_bf19_s2[18] ? exp_s2 : BF22_ONE;
     else
       out_primary_bf22 <= exp_s2;
-  end
 end
 
 endmodule

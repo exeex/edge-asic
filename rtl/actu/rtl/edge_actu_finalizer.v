@@ -45,7 +45,7 @@ reg [21:0]        relay_primary_bf22_q;
 reg [21:0]        relay_rcp_bf22_q;
 
 // M1P: metadata aligned with the registered pair of 14x7 partial products.
-reg [2:0]         mul1_partial_mode_q;
+wire [2:0] mul1_partial_mode_q = mode_pipe[0];
 reg [18:0]        mul1_partial_payload_q;
 reg [21:0]        mul1_partial_direct_q;
 reg               mul1_partial_sign_q;
@@ -54,7 +54,7 @@ reg               mul1_partial_special_q;
 reg signed [11:0] mul1_partial_exp_q;
 
 // M1A: registered raw BF22 numerator/reciprocal product after partial add.
-reg [2:0]         mul1_mode_q;
+wire [2:0] mul1_mode_q = mode_pipe[1];
 reg [18:0]        mul1_payload_q;
 reg [21:0]        mul1_direct_q;
 reg               mul1_sign_q;
@@ -64,13 +64,13 @@ reg signed [11:0] mul1_exp_q;
 reg [27:0]        mul1_product_q;
 
 // M2: first product rounded once to BF22.
-reg [2:0]  mul2_mode_q;
+wire [2:0] mul2_mode_q = mode_pipe[2];
 reg [18:0] mul2_payload_q;
 reg [21:0] mul2_direct_q;
 reg [21:0] mul2_product_bf22_q;
 
 // M3P: metadata/bypass aligned with SiLU's second 14x7 partial pair.
-reg [2:0]         mul3_partial_mode_q;
+wire [2:0] mul3_partial_mode_q = mode_pipe[3];
 reg [21:0]        mul3_partial_bypass_bf22_q;
 reg               mul3_partial_sign_q;
 reg               mul3_partial_zero_q;
@@ -78,7 +78,7 @@ reg               mul3_partial_special_q;
 reg signed [11:0] mul3_partial_exp_q;
 
 // M3A: SiLU's second raw BF22 product or a mode-aligned bypass result.
-reg [2:0]         final_mode_q;
+wire [2:0] final_mode_q = mode_pipe[4];
 reg [21:0]        final_bypass_bf22_q;
 reg               mul3_sign_q;
 reg               mul3_zero_q;
@@ -202,7 +202,7 @@ assign mul1_exp =
      ({4'b0, relay_rcp_bf22_q[20:13]} - 12'sd127));
 // Preserve M1 as a physical leaf so full-ACTU APR can cluster this multiplier
 // independently without changing its combinational boundary or product stage.
-edge_actu_mul14_comb x_mul1 (
+edge_actu_mul14_comb #(.RESET_DATA(0)) x_mul1 (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(mul1_sig_a),
@@ -232,7 +232,7 @@ assign mul3_exp =
      ({4'b0, mul3_lhs_bf22[20:13]} - 12'sd127)) +
     ((mul2_product_bf22_q[20:13] == 8'b0) ? -12'sd126 :
      ({4'b0, mul2_product_bf22_q[20:13]} - 12'sd127));
-edge_actu_mul14_comb x_mul3 (
+edge_actu_mul14_comb #(.RESET_DATA(0)) x_mul3 (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(mul3_sig_a),
@@ -265,60 +265,36 @@ edge_actu_softmax_rsum x_softmax_rsum (
 );
 assign softmax_sum_value = {softmax_sum_bf22, 10'b0};
 
+// Reset cancels valid immediately. Mode travels with unreset data and is
+// unspecified when invalid; the reducer retains its independent state reset.
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
     relay_valid_q <= 1'b0;
-    relay_mode_q <= 3'b0;
-    relay_payload_bf19_q <= 19'b0;
-    relay_primary_bf22_q <= 22'b0;
-    relay_rcp_bf22_q <= 22'b0;
-    mul1_partial_mode_q <= 3'b0;
-    mul1_partial_payload_q <= 19'b0;
-    mul1_partial_direct_q <= 22'b0;
-    mul1_partial_sign_q <= 1'b0;
-    mul1_partial_zero_q <= 1'b0;
-    mul1_partial_special_q <= 1'b0;
-    mul1_partial_exp_q <= 12'sd0;
-    mul1_mode_q <= 3'b0;
-    mul1_payload_q <= 19'b0;
-    mul1_direct_q <= 22'b0;
-    mul1_sign_q <= 1'b0;
-    mul1_zero_q <= 1'b0;
-    mul1_special_q <= 1'b0;
-    mul1_exp_q <= 12'sd0;
-    mul1_product_q <= 28'b0;
-    mul2_mode_q <= 3'b0;
-    mul2_payload_q <= 19'b0;
-    mul2_direct_q <= 22'b0;
-    mul2_product_bf22_q <= 22'b0;
-    mul3_partial_mode_q <= 3'b0;
-    mul3_partial_bypass_bf22_q <= 22'b0;
-    mul3_partial_sign_q <= 1'b0;
-    mul3_partial_zero_q <= 1'b0;
-    mul3_partial_special_q <= 1'b0;
-    mul3_partial_exp_q <= 12'sd0;
-    final_mode_q <= 3'b0;
-    final_bypass_bf22_q <= 22'b0;
-    mul3_sign_q <= 1'b0;
-    mul3_zero_q <= 1'b0;
-    mul3_special_q <= 1'b0;
-    mul3_exp_q <= 12'sd0;
-    mul3_product_q <= 28'b0;
+
     valid_pipe <= {POST_STAGES{1'b0}};
-    for (stage = 0; stage < POST_STAGES; stage = stage + 1)
-      mode_pipe[stage] <= 3'b0;
-    for (stage = 0; stage <= OUTPUT_PIPE_LAST; stage = stage + 1)
-      value_pipe[stage] <= 32'b0;
   end else begin
-    // P0: pure packet relay at the backend/finalizer boundary.
     relay_valid_q <= in_valid;
+
+    valid_pipe[0] <= relay_valid_q;
+    for (stage = 1; stage < POST_STAGES; stage = stage + 1) begin
+      valid_pipe[stage] <= valid_pipe[stage - 1];
+    end
+  end
+end
+
+integer data_stage;
+always @(posedge clk) begin
     relay_mode_q <= in_mode;
+    mode_pipe[0] <= relay_mode_q;
+    for (data_stage = 1; data_stage < POST_STAGES; data_stage = data_stage + 1)
+      mode_pipe[data_stage] <= mode_pipe[data_stage - 1];
+
+    // P0: pure packet relay at the backend/finalizer boundary.
     relay_payload_bf19_q <= in_payload_bf19;
     relay_primary_bf22_q <= in_primary_bf22;
     relay_rcp_bf22_q <= in_rcp_bf22;
 
     // M1P: each multiplier leaf registers two 14x7 partial products.
-    mul1_partial_mode_q <= relay_mode_q;
     mul1_partial_payload_q <= relay_payload_bf19_q;
     mul1_partial_direct_q <= direct_bf22;
     mul1_partial_sign_q <= mul1_sign;
@@ -327,7 +303,6 @@ always @(posedge clk or negedge cpurst_b) begin
     mul1_partial_exp_q <= mul1_exp;
 
     // M1A: add the shifted partials and capture the exact 28-bit product.
-    mul1_mode_q <= mul1_partial_mode_q;
     mul1_payload_q <= mul1_partial_payload_q;
     mul1_direct_q <= mul1_partial_direct_q;
     mul1_sign_q <= mul1_partial_sign_q;
@@ -337,13 +312,11 @@ always @(posedge clk or negedge cpurst_b) begin
     mul1_product_q <= mul1_product;
 
     // M2: normalize and round the first raw product once to BF22.
-    mul2_mode_q <= mul1_mode_q;
     mul2_payload_q <= mul1_payload_q;
     mul2_direct_q <= mul1_direct_q;
     mul2_product_bf22_q <= mul1_product_bf22;
 
     // M3P: second pair of 14x7 partials for SiLU; other modes relay.
-    mul3_partial_mode_q <= mul2_mode_q;
     mul3_partial_bypass_bf22_q <= stage3_bypass_bf22;
     mul3_partial_sign_q <= mul3_sign;
     mul3_partial_zero_q <= mul3_zero;
@@ -351,7 +324,6 @@ always @(posedge clk or negedge cpurst_b) begin
     mul3_partial_exp_q <= mul3_exp;
 
     // M3A: shifted partial add and exact-product capture.
-    final_mode_q <= mul3_partial_mode_q;
     final_bypass_bf22_q <= mul3_partial_bypass_bf22_q;
     mul3_sign_q <= mul3_partial_sign_q;
     mul3_zero_q <= mul3_partial_zero_q;
@@ -361,16 +333,9 @@ always @(posedge clk or negedge cpurst_b) begin
 
     // Output: second-product pack (SiLU) or bypass, then BF16 store round.
     value_pipe[0] <= final_result_bits;
-    for (stage = 1; stage <= OUTPUT_PIPE_LAST; stage = stage + 1)
-      value_pipe[stage] <= value_pipe[stage - 1];
+    for (data_stage = 1; data_stage <= OUTPUT_PIPE_LAST; data_stage = data_stage + 1)
+      value_pipe[data_stage] <= value_pipe[data_stage - 1];
 
-    valid_pipe[0] <= relay_valid_q;
-    mode_pipe[0] <= relay_mode_q;
-    for (stage = 1; stage < POST_STAGES; stage = stage + 1) begin
-      valid_pipe[stage] <= valid_pipe[stage - 1];
-      mode_pipe[stage] <= mode_pipe[stage - 1];
-    end
-  end
 end
 
 endmodule

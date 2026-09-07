@@ -67,7 +67,7 @@ edge_actu_rcp_rsqrt_seed_q16 x_seed (
 );
 
 // S1/S2: register two 14x7 partial products, then add and round once to Q16.
-edge_actu_mul14_round9_q16 x_mul_common (
+edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_common (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(norm_s0[17:4]),
@@ -78,14 +78,14 @@ edge_actu_mul14_round9_q16 x_mul_common (
 // The correction-only boundary starts the next partial-product pair directly.
 // RCP uses 2-m*y0; RSQRT forms m*y0*y0 with the same S3/S4 pair.
 assign rcp_corr_q16 = 18'h20000 - common_mul_s2;
-edge_actu_mul14_round9_q16 x_mul_rsqrt_t1 (
+edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_rsqrt_t1 (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(common_mul_s2[17:4]),
   .rhs_sig_i(seed_s2[16:3]),
   .result_q16_o(rsqrt_t1_q16)
 );
-edge_actu_mul14_round10_q16 x_mul_rcp_result (
+edge_actu_mul14_round10_q16 #(.RESET_DATA(0)) x_mul_rcp_result (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(seed_s2[16:3]),
@@ -98,7 +98,7 @@ edge_actu_mul14_round10_q16 x_mul_rcp_result (
 // so both modes retain one mixed stream with no bubbles.
 assign rsqrt_half_q16 = rsqrt_t1_s4 >> 1;
 assign rsqrt_corr_q16 = 18'h18000 - rsqrt_half_q16;
-edge_actu_mul14_round10_q16 x_mul_rsqrt_result (
+edge_actu_mul14_round10_q16 #(.RESET_DATA(0)) x_mul_rsqrt_result (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(seed_s4[16:3]),
@@ -119,39 +119,19 @@ assign out_value_bf22 = invalid_s6 ? 22'b0 :
                     (biased_exp >= 255 ? {sign_s6, 8'hfe, 13'h1fff} :
                      {sign_s6, biased_exp[7:0], result_fraction}));
 
+// Only validity is cancellation state. Numeric-domain flags are packet data.
 always @(posedge clk or negedge cpurst_b) begin
   if (!cpurst_b) begin
-    valid_s0 <= 1'b0; valid_s1 <= 1'b0; valid_s2 <= 1'b0;
-    valid_s3 <= 1'b0; valid_s4 <= 1'b0; valid_s5 <= 1'b0;
-    valid_s6 <= 1'b0;
-    rsqrt_s0 <= 1'b0; rsqrt_s1 <= 1'b0; rsqrt_s2 <= 1'b0;
-    rsqrt_s3 <= 1'b0; rsqrt_s4 <= 1'b0; rsqrt_s5 <= 1'b0;
-    rsqrt_s6 <= 1'b0;
-    sign_s0 <= 1'b0; sign_s1 <= 1'b0; sign_s2 <= 1'b0;
-    sign_s3 <= 1'b0; sign_s4 <= 1'b0; sign_s5 <= 1'b0;
-    sign_s6 <= 1'b0;
-    invalid_s0 <= 1'b0; invalid_s1 <= 1'b0; invalid_s2 <= 1'b0;
-    invalid_s3 <= 1'b0; invalid_s4 <= 1'b0; invalid_s5 <= 1'b0;
-    invalid_s6 <= 1'b0;
-    exp_s0 <= 10'sd0; exp_s1 <= 10'sd0; exp_s2 <= 10'sd0;
-    exp_s3 <= 10'sd0; exp_s4 <= 10'sd0; exp_s5 <= 10'sd0;
-    exp_s6 <= 10'sd0;
-    norm_s0 <= 18'b0;
-    seed_s0 <= 17'b0; seed_s1 <= 17'b0; seed_s2 <= 17'b0;
-    seed_s3 <= 17'b0; seed_s4 <= 17'b0;
-    common_mul_s2 <= 18'b0;
-    rsqrt_t1_s4 <= 18'b0;
-    rcp_result_s4 <= 18'b0;
-    rcp_result_s5 <= 18'b0;
-    result_s6 <= 18'b0;
+    valid_s0<=0;valid_s1<=0;valid_s2<=0;valid_s3<=0;
+    valid_s4<=0;valid_s5<=0;valid_s6<=0;
   end else begin
-    valid_s0 <= in_valid;
-    valid_s1 <= valid_s0;
-    valid_s2 <= valid_s1;
-    valid_s3 <= valid_s2;
-    valid_s4 <= valid_s3;
-    valid_s5 <= valid_s4;
-    valid_s6 <= valid_s5;
+    valid_s0<=in_valid;valid_s1<=valid_s0;valid_s2<=valid_s1;
+    valid_s3<=valid_s2;valid_s4<=valid_s3;valid_s5<=valid_s4;valid_s6<=valid_s5;
+  end
+end
+
+// Seven aligned captures refill before any valid output becomes observable.
+always @(posedge clk) begin
     rsqrt_s0 <= in_rsqrt;
     rsqrt_s1 <= rsqrt_s0;
     rsqrt_s2 <= rsqrt_s1;
@@ -191,7 +171,6 @@ always @(posedge clk or negedge cpurst_b) begin
     rcp_result_s4 <= rcp_result_q16;
     rcp_result_s5 <= rcp_result_s4;
     result_s6 <= rsqrt_s5 ? rsqrt_result_q16 : rcp_result_s5;
-  end
 end
 
 endmodule

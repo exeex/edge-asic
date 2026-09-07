@@ -43,8 +43,15 @@ module edge_actu_exp_range_bf22_scale (
 );
 // magnitude <= 88*65536. Product needs 52 bits; signed code needs 20.
 wire [51:0] product = magnitude_q16 * 29'd387270501;
-wire [19:0] positive_code = product[51:32];
-wire [19:0] code = sign_z ? (~positive_code + {19'b0,!(|product[31:0])}) : positive_code;
-assign exp2_k = {{2{code[19]}},code[19:12]};
-assign frac_code = code[11:0];
+wire [19:0] unsigned_code = product[51:32];
+wire [7:0] integer_part = unsigned_code[19:12];
+wire [11:0] fraction_code = unsigned_code[11:0];
+// An odd coefficient times a nonzero 23-bit magnitude cannot be divisible
+// by 2**32. Negative floor therefore complements both Q12 fields, even
+// when fraction_code is zero. Zero must keep exponent/index zero.
+wire negative_nonzero = sign_z && (|magnitude_q16);
+// The bounded magnitude makes integer_part <= 126. Sign extension plus
+// complement encodes -integer_part-1 without a carry-propagating adder.
+assign exp2_k = negative_nonzero ? ~{2'b00,integer_part} : {2'b00,integer_part};
+assign frac_code = negative_nonzero ? ~fraction_code : fraction_code;
 endmodule
