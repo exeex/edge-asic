@@ -225,7 +225,9 @@ module edge_dot_kernel #(
   parameter ALIGN_GUARD_BITS = 0,
   parameter INPUTS_SANITIZED = 0,
   parameter EXTERNAL_WEIGHT_EXP = 0,
-  parameter EXTERNAL_PRODUCTS = 0
+  parameter EXTERNAL_PRODUCTS = 0,
+  // External leaf captures operands at s0; its combinational product enters s1.
+  parameter EXTERNAL_PRODUCTS_REGISTERED = 0
 )(
   clk,
   rst_b,
@@ -278,6 +280,12 @@ reg         s6_valid;
 reg [15:0]  s0_bf16 [0:LANES-1];
 reg [7:0]   s0_int8 [0:LANES-1];
 reg [15:0]  s0_weight_bf16 [0:LANES-1];
+// External-product rows consume only exponent metadata and nonzero predicates.
+// Capture each predicate with its input, avoiding a tail of significand flops.
+reg s0_activation_nonzero [0:LANES-1];
+reg s0_weight_nonzero [0:LANES-1];
+wire [15:0] ingress_activation [0:LANES-1];
+wire [15:0] ingress_weight [0:LANES-1];
 reg [7:0]   s0_weight_exp_external [0:LANES-1];
 reg [15:0]  s0_external_product [0:LANES-1];
 reg         s0_external_product_sign [0:LANES-1];
@@ -369,16 +377,28 @@ generate
     assign weight_exp_comb[lane_idx*8 +: 8]
       = EXTERNAL_WEIGHT_EXP ? s0_weight_exp_external[lane_idx]
                             : s0_weight_bf16[lane_idx][14:7];
+    assign ingress_activation[lane_idx] = INPUTS_SANITIZED
+      ? bf16_vec_i[lane_idx*16 +: 16]
+      : sanitize_bf16(bf16_vec_i[lane_idx*16 +: 16]);
+    assign ingress_weight[lane_idx] = INPUTS_SANITIZED
+      ? bf16_weight_vec_i[lane_idx*16 +: 16]
+      : sanitize_bf16(bf16_weight_vec_i[lane_idx*16 +: 16]);
     assign activation_nonzero_comb[lane_idx]
-      = (s0_bf16[lane_idx][14:0] != 15'b0);
+      = EXTERNAL_PRODUCTS ? s0_activation_nonzero[lane_idx]
+                          : (s0_bf16[lane_idx][14:0] != 15'b0);
     assign weight_nonzero_comb[lane_idx]
-      = s0_weight_bf16_mode
-        ? (s0_weight_bf16[lane_idx][14:0] != 15'b0)
-        : (s0_int8[lane_idx] != 8'b0);
+      = EXTERNAL_PRODUCTS ? s0_weight_nonzero[lane_idx]
+        : (s0_weight_bf16_mode
+           ? (s0_weight_bf16[lane_idx][14:0] != 15'b0)
+           : (s0_int8[lane_idx] != 8'b0));
 
     if (EXTERNAL_PRODUCTS) begin : gen_external_product
-      assign product_comb[lane_idx] = s0_external_product[lane_idx];
-      assign sign_comb[lane_idx] = s0_external_product_sign[lane_idx];
+      assign product_comb[lane_idx] = EXTERNAL_PRODUCTS_REGISTERED
+        ? external_product_vec_i[lane_idx*16 +: 16]
+        : s0_external_product[lane_idx];
+      assign sign_comb[lane_idx] = EXTERNAL_PRODUCTS_REGISTERED
+        ? external_product_sign_i[lane_idx]
+        : s0_external_product_sign[lane_idx];
     end else begin : gen_internal_product
       edge_dot_mul_lane #(.FPGA_DSP_MUL(FPGA_DSP_MUL)) x_mul_lane (
         .activation_i(s0_bf16[lane_idx]),
@@ -948,14 +968,12 @@ always @(posedge clk or negedge rst_b) begin
     end
 
     for (i = 0; i < LANES; i = i + 1) begin
-      s0_bf16[i] <= INPUTS_SANITIZED
-                    ? bf16_vec_i[i*16 +: 16]
-                    : sanitize_bf16(bf16_vec_i[i*16 +: 16]);
+      s0_bf16[i] <= ingress_activation[i];
       s0_int8[i] <= int8_vec_i[i*8 +: 8];
-      s0_weight_bf16[i] <= INPUTS_SANITIZED
-                           ? bf16_weight_vec_i[i*16 +: 16]
-                           : sanitize_bf16(
-                               bf16_weight_vec_i[i*16 +: 16]);
+      s0_weight_bf16[i] <= ingress_weight[i];
+      s0_activation_nonzero[i] <= |ingress_activation[i][14:0];
+      s0_weight_nonzero[i] <= weight_bf16_mode_i
+        ? (|ingress_weight[i][14:0]) : (|int8_vec_i[i*8 +: 8]);
       s0_weight_exp_external[i] <= weight_exp_vec_i[i*8 +: 8];
       s0_external_product[i] <= external_product_vec_i[i*16 +: 16];
       s0_external_product_sign[i] <= external_product_sign_i[i];
