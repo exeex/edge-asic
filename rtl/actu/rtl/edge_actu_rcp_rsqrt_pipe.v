@@ -55,8 +55,8 @@ reg signed [9:0] exp_s4, exp_s5, exp_s6;
 reg [17:0]  norm_s0;
 reg [16:0]  seed_s0, seed_s1, seed_s2, seed_s3, seed_s4;
 reg [17:0]  common_mul_s2;
-reg [17:0]  rsqrt_t1_s4;
-reg [17:0]  rcp_result_s4;
+reg [13:0]  rsqrt_corr_s4;
+reg [13:0]  rcp_corr_s3;
 reg [17:0]  rcp_result_s5;
 reg [17:0]  result_s6;
 
@@ -110,8 +110,9 @@ edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_common (
   .result_q16_o(common_mul_q16)
 );
 
-// The correction-only boundary starts the next partial-product pair directly.
-// RCP uses 2-m*y0; RSQRT forms m*y0*y0 with the same S3/S4 pair.
+// S3/S4: RSQRT forms m*y0*y0. RCP captures its correction at S3,
+// then starts its result partial products at S4 instead of relaying a wide
+// completed result. This separates correction carry propagation from multiply.
 assign rcp_corr_q16 = 18'h20000 - common_mul_s2;
 edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_rsqrt_t1 (
   .clk(clk),
@@ -123,21 +124,21 @@ edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_rsqrt_t1 (
 edge_actu_mul14_round10_q16 #(.RESET_DATA(0)) x_mul_rcp_result (
   .clk(clk),
   .cpurst_b(cpurst_b),
-  .lhs_sig_i(seed_s2[16:3]),
-  .rhs_sig_i(rcp_corr_q16[16:3]),
+  .lhs_sig_i(seed_s3[16:3]),
+  .rhs_sig_i(rcp_corr_s3),
   .result_q16_o(rcp_result_q16)
 );
 
-// S5/S6: RSQRT's fixed 0.5 and correction remain shifts/adds; only its final
-// product consumes the third two-stage multiplier.  RCP waits two relay stages
-// so both modes retain one mixed stream with no bubbles.
-assign rsqrt_half_q16 = rsqrt_t1_s4 >> 1;
+// Fold RSQRT correction into the S4 sum/round capture; S5 now contains
+// only the result partial products. RCP captures its rounded result at S5,
+// and both modes still meet at S6 with unchanged seven-capture latency.
+assign rsqrt_half_q16 = rsqrt_t1_q16 >> 1;
 assign rsqrt_corr_q16 = 18'h18000 - rsqrt_half_q16;
 edge_actu_mul14_round10_q16 #(.RESET_DATA(0)) x_mul_rsqrt_result (
   .clk(clk),
   .cpurst_b(cpurst_b),
   .lhs_sig_i(seed_s4[16:3]),
-  .rhs_sig_i(rsqrt_corr_q16[16:3]),
+  .rhs_sig_i(rsqrt_corr_s4),
   .result_q16_o(rsqrt_result_q16)
 );
 
@@ -209,9 +210,9 @@ always @(posedge clk) begin
     seed_s3 <= seed_s2;
     seed_s4 <= seed_s3;
     common_mul_s2 <= common_mul_q16;
-    rsqrt_t1_s4 <= rsqrt_t1_q16;
-    rcp_result_s4 <= rcp_result_q16;
-    rcp_result_s5 <= rcp_result_s4;
+    rsqrt_corr_s4 <= rsqrt_corr_q16[16:3];
+    rcp_corr_s3 <= rcp_corr_q16[16:3];
+    rcp_result_s5 <= rcp_result_q16;
     result_s6 <= rsqrt_s5 ? rsqrt_result_q16 : rcp_result_s5;
 end
 
