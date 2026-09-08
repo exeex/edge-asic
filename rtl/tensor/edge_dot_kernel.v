@@ -85,6 +85,76 @@ endgenerate
 assign global_max_exp_o = max_root[10] ? $signed(max_root[9:0]) : 10'sd0;
 endmodule
 
+// Central exponent-only pipeline. Keep the common -134 bias out of the max
+// and shift critical paths: shift = max(raw_exp) - raw_exp. BF16 uses the sum
+// of effective exponents; I8 uses activation_exp+134 in the same unsigned domain.
+module edge_dot_exp_parallel #(parameter LANES = 16)(
+  input clk, rst_b,
+  input [LANES*8-1:0] activation_exp_i, weight_exp_i,
+  input [LANES-1:0] activation_nonzero_i, weight_nonzero_i,
+  input weight_bf16_mode_i,
+  output signed [9:0] max_exp_o,
+  output [LANES*11-1:0] shift_o
+);
+// Six comparisons run concurrently. Ties select the lowest input index.
+// The one-hot decode is a small Boolean LUT, not a wide exponent ROM.
+function [9:0] max4_parallel;
+  input [9:0] a,b,c,d;
+  reg ab,ac,ad,bc,bd,cd;
+  reg wa,wb,wc,wd;
+  begin
+    ab=(a>=b); ac=(a>=c); ad=(a>=d);
+    bc=(b>=c); bd=(b>=d); cd=(c>=d);
+    wa=ab && ac && ad;
+    wb=!ab && bc && bd;
+    wc=!ac && !bc && cd;
+    wd=!ad && !bd && !cd;
+    max4_parallel=({10{wa}} & a) | ({10{wb}} & b)
+                | ({10{wc}} & c) | ({10{wd}} & d);
+  end
+endfunction
+localparam GROUPS = LANES/4;
+reg [8:0] s0_raw_exp [0:LANES-1];
+reg s0_eligible [0:LANES-1];
+reg [8:0] s1_raw_exp [0:LANES-1];
+reg [9:0] s1_group_max [0:GROUPS-1];
+wire [9:0] tree [1:2*GROUPS-1];
+wire [8:0] maximum = tree[1][9] ? tree[1][8:0] : 9'd134;
+genvar k;
+generate
+  for(k=0;k<LANES;k=k+1) begin : EXP_LANE
+    wire [7:0] ae=activation_exp_i[k*8+:8];
+    wire [7:0] we=weight_exp_i[k*8+:8];
+    wire [8:0] raw_exp = weight_bf16_mode_i
+      ? {1'b0,(ae==0 ? 8'd1 : ae)} + {1'b0,(we==0 ? 8'd1 : we)}
+      : {1'b0,ae} + 9'd134;
+    always @(posedge clk) if(rst_b) begin
+      s0_raw_exp[k] <= raw_exp;
+      s0_eligible[k] <= activation_nonzero_i[k] && weight_nonzero_i[k];
+      s1_raw_exp[k] <= s0_raw_exp[k];
+    end
+    assign shift_o[k*11+:11] = $signed({2'b0,maximum}) - $signed({2'b0,s1_raw_exp[k]});
+  end
+  for(k=0;k<GROUPS;k=k+1) begin : GROUP_MAX
+    wire [9:0] a={s0_eligible[4*k],s0_raw_exp[4*k]};
+    wire [9:0] b={s0_eligible[4*k+1],s0_raw_exp[4*k+1]};
+    wire [9:0] c={s0_eligible[4*k+2],s0_raw_exp[4*k+2]};
+    wire [9:0] d={s0_eligible[4*k+3],s0_raw_exp[4*k+3]};
+    always @(posedge clk) if(rst_b) s1_group_max[k] <= max4_parallel(a,b,c,d);
+    assign tree[GROUPS+k]=s1_group_max[k];
+  end
+  if(GROUPS==4) begin : FINAL_MAX4
+    assign tree[1]=max4_parallel(s1_group_max[0],s1_group_max[1],
+      s1_group_max[2],s1_group_max[3]);
+  end else begin : FINAL_BINARY
+    for(k=1;k<GROUPS;k=k+1) begin : MAX
+      assign tree[k]=(tree[2*k]>=tree[2*k+1])?tree[2*k]:tree[2*k+1];
+    end
+  end
+endgenerate
+assign max_exp_o = $signed({1'b0,maximum}) - 10'sd134;
+endmodule
+
 // Local multiplier lane.  Exponent arithmetic is intentionally absent; the
 // lane consumes only significands/signs and later receives a shift distance.
 module edge_dot_mul_lane #(
@@ -206,12 +276,14 @@ endmodule
 // One reusable dual-mode BF16 x {INT8, BF16} dot8 row.
 //
 // Pipeline:
-//   s0: sanitize BF16 lanes
-//   s1: unsigned magnitude multiplies and product-exponent adds
-//   s2: balanced global exponent max; delay mantissa products beside it
+//   s0: sanitize BF16 lanes; parallel exponent island captures unbiased sums
+//   s1: PARALLEL_MAX_SHIFT captures four local exponent maxima and mantissa
+//       operands; otherwise product-exponent adds and magnitude products
+//   s2: global exponent max; PARALLEL_MAX_SHIFT finishes 4-to-1, captures shifts and
+//       parallel mantissa multiplies, otherwise it relays products
 //   s3: coarse product alignment by 0/8/16/24 bits
 //   s4: fine product alignment by 0..7 bits, RNE, and sign
-//   s5: signed adder tree
+//   s5: signed adder tree; SPLIT_REDUCTION adds s5a (16-to-4) before s5 (4-to-1)
 //   s6: normalize the row sum; either round directly to BF16 or accumulate
 //       successive row sums in the private BF22 RSUM accumulator
 //   r6: emit one BF16 result when the RSUM sequence marks its last row
@@ -227,7 +299,11 @@ module edge_dot_kernel #(
   parameter EXTERNAL_WEIGHT_EXP = 0,
   parameter EXTERNAL_PRODUCTS = 0,
   // External leaf captures operands at s0; its combinational product enters s1.
-  parameter EXTERNAL_PRODUCTS_REGISTERED = 0
+  parameter EXTERNAL_PRODUCTS_REGISTERED = 0,
+  // E4 partial-only dot16: insert a full-precision 16-to-4 capture.
+  parameter SPLIT_REDUCTION = 0,
+  // Retimed product and precomputed shift meet at s2.
+  parameter PARALLEL_MAX_SHIFT = 0
 )(
   clk,
   rst_b,
@@ -298,6 +374,10 @@ reg [15:0]  s2_prod [0:LANES-1];
 reg         s2_sign [0:LANES-1];
 reg signed [9:0] s2_exp [0:LANES-1];
 reg signed [9:0] s2_max_exp;
+reg signed [10:0] s2_shift [0:LANES-1];
+wire [LANES*11-1:0] parallel_shift;
+wire [15:0] parallel_product [0:LANES-1];
+wire parallel_sign [0:LANES-1];
 reg [17:0]  s3_coarse [0:LANES-1];
 reg [2:0]   s3_fine [0:LANES-1];
 reg         s3_coarse_guard [0:LANES-1];
@@ -343,6 +423,8 @@ wire [LANES*10-1:0] product_exp_comb;
 wire [LANES-1:0] product_exp_valid_comb;
 wire [LANES*10-1:0] s1_product_exp_vec;
 wire [LANES-1:0] s1_product_valid_vec;
+wire [LANES*8-1:0] ingress_activation_exp, ingress_weight_exp;
+wire [LANES-1:0] ingress_activation_nonzero, ingress_weight_nonzero;
 wire [LANES*8-1:0] activation_exp_comb;
 wire [LANES*8-1:0] weight_exp_comb;
 wire [LANES-1:0] activation_nonzero_comb;
@@ -361,6 +443,9 @@ wire [31:0] rsum_base_bits;
 wire [31:0] rsum_next_bits;
 wire [31:0] rsum_next_bf16_bits;
 wire signed [SUM_WIDTH-1:0] s5_sum_next;
+wire reduction_valid;
+wire signed [9:0] reduction_exp;
+wire reduction_rsum_enable, reduction_rsum_first, reduction_rsum_last;
 wire signed [SUM_WIDTH-1:0] s4_lane_ext [0:LANES-1];
 
 genvar lane_idx;
@@ -383,6 +468,12 @@ generate
     assign ingress_weight[lane_idx] = INPUTS_SANITIZED
       ? bf16_weight_vec_i[lane_idx*16 +: 16]
       : sanitize_bf16(bf16_weight_vec_i[lane_idx*16 +: 16]);
+    assign ingress_activation_exp[lane_idx*8+:8] = ingress_activation[lane_idx][14:7];
+    assign ingress_weight_exp[lane_idx*8+:8] = EXTERNAL_WEIGHT_EXP
+      ? weight_exp_vec_i[lane_idx*8+:8] : ingress_weight[lane_idx][14:7];
+    assign ingress_activation_nonzero[lane_idx] = |ingress_activation[lane_idx][14:0];
+    assign ingress_weight_nonzero[lane_idx] = weight_bf16_mode_i
+      ? (|ingress_weight[lane_idx][14:0]) : (|int8_vec_i[lane_idx*8+:8]);
     assign activation_nonzero_comb[lane_idx]
       = EXTERNAL_PRODUCTS ? s0_activation_nonzero[lane_idx]
                           : (s0_bf16[lane_idx][14:0] != 15'b0);
@@ -410,8 +501,35 @@ generate
       );
     end
 
-    assign shift_amount_comb[lane_idx]
-      = $signed(s2_max_exp) - $signed(s2_exp[lane_idx]);
+    if (PARALLEL_MAX_SHIFT) begin : gen_parallel_product
+      if (EXTERNAL_PRODUCTS) begin : gen_local
+        // External leaf relays selected operands at s1, multiplies into s2.
+        assign parallel_product[lane_idx] = external_product_vec_i[lane_idx*16+:16];
+        assign parallel_sign[lane_idx] = external_product_sign_i[lane_idx];
+      end else begin : gen_direct
+        reg [7:0] activation_sig_q, weight_sig_q;
+        reg sign_q;
+        wire [7:0] i8_mag = s0_int8[lane_idx][7]
+          ? -s0_int8[lane_idx] : s0_int8[lane_idx];
+        always @(posedge clk) if (rst_b) begin
+          activation_sig_q <= {(s0_bf16[lane_idx][14:7]!=0),s0_bf16[lane_idx][6:0]};
+          weight_sig_q <= s0_weight_bf16_mode
+            ? {(s0_weight_bf16[lane_idx][14:7]!=0),s0_weight_bf16[lane_idx][6:0]} : i8_mag;
+          sign_q <= s0_bf16[lane_idx][15] ^ (s0_weight_bf16_mode
+            ? s0_weight_bf16[lane_idx][15] : s0_int8[lane_idx][7]);
+        end
+        edge_bf16_sig_mul #(.FPGA_DSP_MUL(FPGA_DSP_MUL)) x_mul (
+          .activation_sig_i(activation_sig_q),.weight_sig_i(weight_sig_q),
+          .product_o(parallel_product[lane_idx]));
+        assign parallel_sign[lane_idx] = sign_q;
+      end
+    end else begin : gen_no_parallel_product
+      assign parallel_product[lane_idx] = 16'b0;
+      assign parallel_sign[lane_idx] = 1'b0;
+    end
+    assign shift_amount_comb[lane_idx] = PARALLEL_MAX_SHIFT
+      ? s2_shift[lane_idx]
+      : ($signed(s2_max_exp) - $signed(s2_exp[lane_idx]));
     edge_dot_align_lane_coarse #(
       .ALIGN_GUARD_BITS(ALIGN_GUARD_BITS)
     ) x_align_lane (
@@ -446,13 +564,70 @@ edge_dot_product_exp #(.LANES(LANES)) x_product_exp (
   .product_valid_o(product_exp_valid_comb)
 );
 
-edge_dot_exp_max #(.LANES(LANES)) x_exp_max (
-  .product_exp_i(s1_product_exp_vec),
-  .product_valid_i(s1_product_valid_vec),
-  .global_max_exp_o(max_exp_comb)
-);
+generate
+  if (PARALLEL_MAX_SHIFT) begin : gen_parallel_exp
+    edge_dot_exp_parallel #(.LANES(LANES)) x_max_shift (
+      .clk(clk),.rst_b(rst_b),
+      .activation_exp_i(ingress_activation_exp),.weight_exp_i(ingress_weight_exp),
+      .activation_nonzero_i(ingress_activation_nonzero),
+      .weight_nonzero_i(ingress_weight_nonzero),.weight_bf16_mode_i(weight_bf16_mode_i),
+      .max_exp_o(max_exp_comb),.shift_o(parallel_shift));
+  end else begin : gen_serial_exp
+    edge_dot_exp_max #(.LANES(LANES)) x_exp_max (
+      .product_exp_i(s1_product_exp_vec),.product_valid_i(s1_product_valid_vec),
+      .global_max_exp_o(max_exp_comb));
+    assign parallel_shift = 0;
+  end
+endgenerate
 
 generate
+  if (SPLIT_REDUCTION && LANES == 16) begin : gen_split_add16
+    reg signed [22:0] s5a_group [0:3];
+    reg signed [9:0] s5a_exp;
+    reg s5a_valid;
+    reg s5a_rsum_enable, s5a_rsum_first, s5a_rsum_last;
+    for (genvar group_idx = 0; group_idx < 4; group_idx = group_idx + 1) begin : gen_group
+      wire signed [21:0] pair01 =
+        {s4_lane[group_idx*4][20], s4_lane[group_idx*4]} +
+        {s4_lane[group_idx*4+1][20], s4_lane[group_idx*4+1]};
+      wire signed [21:0] pair23 =
+        {s4_lane[group_idx*4+2][20], s4_lane[group_idx*4+2]} +
+        {s4_lane[group_idx*4+3][20], s4_lane[group_idx*4+3]};
+      always @(posedge clk) begin
+        if (rst_b) s5a_group[group_idx] <=
+          {pair01[21], pair01} + {pair23[21], pair23};
+      end
+    end
+    always @(posedge clk or negedge rst_b) begin
+      if (!rst_b) begin
+        s5a_valid <= 1'b0;
+        s5a_rsum_enable <= 1'b0;
+        s5a_rsum_first <= 1'b0;
+        s5a_rsum_last <= 1'b0;
+      end else begin
+        s5a_valid <= s4_valid;
+        s5a_rsum_enable <= s4_rsum_enable;
+        s5a_rsum_first <= s4_rsum_first;
+        s5a_rsum_last <= s4_rsum_last;
+      end
+    end
+    always @(posedge clk) if (rst_b) s5a_exp <= s4_max_exp;
+    wire signed [23:0] half01 =
+      {s5a_group[0][22], s5a_group[0]} + {s5a_group[1][22], s5a_group[1]};
+    wire signed [23:0] half23 =
+      {s5a_group[2][22], s5a_group[2]} + {s5a_group[3][22], s5a_group[3]};
+    assign s5_sum_next = $signed({half01[23], half01}) + $signed({half23[23], half23});
+    assign reduction_valid = s5a_valid;
+    assign reduction_exp = s5a_exp;
+    assign reduction_rsum_enable = s5a_rsum_enable;
+    assign reduction_rsum_first = s5a_rsum_first;
+    assign reduction_rsum_last = s5a_rsum_last;
+  end else begin : gen_unsplit_add
+    assign reduction_valid = s4_valid;
+    assign reduction_exp = s4_max_exp;
+    assign reduction_rsum_enable = s4_rsum_enable;
+    assign reduction_rsum_first = s4_rsum_first;
+    assign reduction_rsum_last = s4_rsum_last;
   if (FPGA_DSP_ADD) begin : gen_fpga_dsp_add
     (* use_dsp = "simd" *) wire signed [23:0] sum01 =
       s4_lane_ext[0] + s4_lane_ext[1];
@@ -480,6 +655,7 @@ generate
                        + s4_lane_ext[10] + s4_lane_ext[11]
                        + s4_lane_ext[12] + s4_lane_ext[13]
                        + s4_lane_ext[14] + s4_lane_ext[15];
+  end
   end
 endgenerate
 
@@ -933,28 +1109,28 @@ always @(posedge clk or negedge rst_b) begin
     s2_valid <= s1_valid;
     s3_valid <= s2_valid;
     s4_valid <= s3_valid;
-    s5_valid <= s4_valid;
+    s5_valid <= reduction_valid;
     s6_valid <= s5_valid;
     s0_rsum_enable <= rsum_enable_i;
     s1_rsum_enable <= s0_rsum_enable;
     s2_rsum_enable <= s1_rsum_enable;
     s3_rsum_enable <= s2_rsum_enable;
     s4_rsum_enable <= s3_rsum_enable;
-    s5_rsum_enable <= s4_rsum_enable;
+    s5_rsum_enable <= reduction_rsum_enable;
     s6_rsum_enable <= s5_rsum_enable;
     s0_rsum_first <= rsum_first_i;
     s1_rsum_first <= s0_rsum_first;
     s2_rsum_first <= s1_rsum_first;
     s3_rsum_first <= s2_rsum_first;
     s4_rsum_first <= s3_rsum_first;
-    s5_rsum_first <= s4_rsum_first;
+    s5_rsum_first <= reduction_rsum_first;
     s6_rsum_first <= s5_rsum_first;
     s0_rsum_last <= rsum_last_i;
     s1_rsum_last <= s0_rsum_last;
     s2_rsum_last <= s1_rsum_last;
     s3_rsum_last <= s2_rsum_last;
     s4_rsum_last <= s3_rsum_last;
-    s5_rsum_last <= s4_rsum_last;
+    s5_rsum_last <= reduction_rsum_last;
     s6_rsum_last <= s5_rsum_last;
 
     rsum_output_valid_q <= 1'b0;
@@ -989,8 +1165,9 @@ always @(posedge clk or negedge rst_b) begin
 
     s2_max_exp <= max_exp_comb;
     for (i = 0; i < LANES; i = i + 1) begin
-      s2_prod[i] <= s1_prod[i];
-      s2_sign[i] <= s1_sign[i];
+      s2_prod[i] <= PARALLEL_MAX_SHIFT ? parallel_product[i] : s1_prod[i];
+      s2_sign[i] <= PARALLEL_MAX_SHIFT ? parallel_sign[i] : s1_sign[i];
+      s2_shift[i] <= parallel_shift[i*11+:11];
       s2_exp[i] <= s1_exp[i];
     end
 
@@ -1009,7 +1186,7 @@ always @(posedge clk or negedge rst_b) begin
       s4_lane[i] <= aligned_comb[i];
     end
 
-    s5_max_exp <= s4_max_exp;
+    s5_max_exp <= reduction_exp;
     s5_sum <= s5_sum_next;
 
     s6_bf16 <= normalize_sum_to_bf16(s5_sum, s5_max_exp);
