@@ -90,8 +90,20 @@ edge_actu_exp_lut_pair x_lut(range_frac,range_hi,range_residual);
 wire [20:0] residual_product=hi_q*residual_q;
 wire [28:0] mantissa_q28={hi_q,14'b0}+{8'b0,residual_product};
 wire round_increment=mantissa_q28[14] && (|mantissa_q28[13:0] || mantissa_q28[15]);
+// RNE low carry is independent of the full mantissa carry-propagate sum.
+// No carry enters bit14; when carry15=1, guard14=0, so carry and RNE increment
+// are mutually exclusive. Upper increment is precomputed alongside low addition.
+wire round_carry=(hi_q[0] & residual_product[14]) |
+ ((hi_q[0] ^ residual_product[14]) &
+ ((|residual_product[13:0]) | (hi_q[1] ^ residual_product[15])));
+wire [6:0] unrounded_low={1'b0,hi_q[6:1]}+{1'b0,residual_product[20:15]};
+wire [6:0] round_low={1'b0,hi_q[6:1]}+{1'b0,residual_product[20:15]}+{6'b0,round_carry};
+wire [8:0] round_high_inc={1'b0,hi_q[14:7]}+9'd1;
+// Preserve the original 29-bit mantissa wrap for arbitrary non-LUT operands.
+wire rounded_overflow=round_low[6] && (&hi_q[14:7]) && !unrounded_low[6] && !(hi_q[0] & residual_product[14]);
+wire [14:0] rounded_parallel={rounded_overflow,round_low[6] ? round_high_inc[7:0] : hi_q[14:7],round_low[5:0]};
 always @(posedge clk) begin
-  out_rounded_mant<=PRE_ROUNDED_EXP ? ({1'b0,mantissa_q28[28:15]}+{14'b0,round_increment}) : 15'b0;
+  out_rounded_mant<=PRE_ROUNDED_EXP ? rounded_parallel : 15'b0;
   hi_q<=range_hi;residual_q<=range_residual;k_q<=range_k;frac_q<=range_frac;
   underflow_lut_q<=underflow_q;overflow_lut_q<=overflow_q;clamp_lut_q<=clamp_q;
   out_hi<=PRE_ROUNDED_EXP ? 15'b0 : hi_q;out_residual<=residual_q;
