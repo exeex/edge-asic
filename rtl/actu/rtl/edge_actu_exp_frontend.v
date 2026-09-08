@@ -41,6 +41,7 @@ reg [2:0] exp_class_s0, exp_class_s1, exp_class_s2;
 reg [2:0] payload_class_s0, payload_class_s1, payload_class_s2;
 reg [2:0] scalar_class_s0, scalar_class_s1, scalar_class_s2;
 reg [2:0] den_class_s2, add_class_s2;
+reg add_saturated_s2;
 wire [2:0] exp_packed_class;
 assign exp_class=exp_underflow ? 3'd1 :
                  (RANGE_STATUS && exp_overflow) ? 3'd4 :
@@ -444,12 +445,15 @@ always @(posedge clk) begin
   exp_class_s0<=exp_class;exp_class_s1<=exp_class_s0;exp_class_s2<=exp_class_s1;
   payload_class_s0<=input_class;payload_class_s1<=payload_class_s0;payload_class_s2<=payload_class_s1;
   scalar_class_s0<=scalar_class;scalar_class_s1<=scalar_class_s0;scalar_class_s2<=scalar_class_s1;
-  den_class_s2<=den_class;add_class_s2<=add_class;
+  den_class_s2<=den_class;
+  // Integrated output policy consumes only saturation; compatibility keeps class.
+  add_class_s2<=OUTPUT_POLICY ? 3'd0 : add_class;
+  add_saturated_s2<=OUTPUT_POLICY && (add_class==3'd3);
   out_payload_class<=payload_class_s2;
   // Output policy combines generated state with mode; it never drives arithmetic.
   out_result_action<=0;
   if(OUTPUT_POLICY)begin
-    if(mode_s2==3'd6 && add_class_s2==3'd3)out_result_action<=4'd9;
+    if(mode_s2==3'd6 && add_saturated_s2)out_result_action<=4'd9;
     else if(mode_s2==3'd0 || mode_s2==3'd5)begin
       if(exp_class_s2==3'd3)out_result_action<=4'd10;
     end else if(exp_class_s2==3'd1)begin
