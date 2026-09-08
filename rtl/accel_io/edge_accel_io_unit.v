@@ -16,7 +16,8 @@ module edge_accel_io_unit #(
   output wire dtcm_rd_req, input wire dtcm_rd_ready,
   output wire [ADDR_WIDTH-1:0] dtcm_rd_addr,
   input wire dtcm_rd_rvalid, input wire [127:0] dtcm_rd_rdata,
-  output wire dtcm_wr_req, input wire dtcm_wr_ready,
+  output wire dtcm_wr_req,
+  output wire dtcm_wr_pair_ready, output wire dtcm_wr_last, input wire dtcm_wr_ready,
   output wire [ADDR_WIDTH-1:0] dtcm_wr_addr,
   output wire [127:0] dtcm_wr_wdata, output wire [15:0] dtcm_wr_wstrb,
   input wire [31:0] actu_scalar_bits,
@@ -61,7 +62,8 @@ wire [31:0] selected_actu_scalar = (core_mode == 4'd7) ?
 wire core_job_done = core_owner || (core_mode != 4'd5) || actu_sum_done_i;
 assign actu_last_sum_bits = last_actu_sum_q;
 
-edge_accel_io #(.ADDR_WIDTH(ADDR_WIDTH)) io (
+// Reserve 27 core cycles plus two-beat output gathering and route stalls.
+edge_accel_io #(.ADDR_WIDTH(ADDR_WIDTH),.WR_FIFO_DEPTH(8)) io (
  .clk(clk),.cpurst_b(cpurst_b),.start_valid(start_valid),.start_ready(start_ready),
  .start_owner(start_owner),.start_mode(start_mode),
  .src0_enable(src0_enable),.src0_is_byte(src0_is_byte),.src0_addr(src0_addr),
@@ -71,7 +73,8 @@ edge_accel_io #(.ADDR_WIDTH(ADDR_WIDTH)) io (
  .n_elements(n_elements),.busy(busy),.done_valid(done_valid),
  .dtcm_rd_req(dtcm_rd_req),.dtcm_rd_ready(dtcm_rd_ready),.dtcm_rd_addr(dtcm_rd_addr),
  .dtcm_rd_rvalid(dtcm_rd_rvalid),.dtcm_rd_rdata(dtcm_rd_rdata),
- .dtcm_wr_req(dtcm_wr_req),.dtcm_wr_ready(dtcm_wr_ready),.dtcm_wr_addr(dtcm_wr_addr),
+ .dtcm_wr_req(dtcm_wr_req),
+  .dtcm_wr_pair_ready(dtcm_wr_pair_ready),.dtcm_wr_last(dtcm_wr_last),.dtcm_wr_ready(dtcm_wr_ready),.dtcm_wr_addr(dtcm_wr_addr),
  .dtcm_wr_wdata(dtcm_wr_wdata),.dtcm_wr_wstrb(dtcm_wr_wstrb),
  .core_start_valid(core_start_valid),.core_start_ready(core_start_ready),
  .core_owner(core_owner),.core_mode(core_mode),.core_in_valid(core_in_valid),

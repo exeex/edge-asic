@@ -4,7 +4,8 @@ module edge_accel_io #(
   parameter ADDR_WIDTH = 16,
   parameter FIFO_DEPTH = 32,
   parameter FIFO_INDEX_WIDTH = 5,
-  parameter BEAT_BITS = 128
+  parameter BEAT_BITS = 128,
+  parameter WR_FIFO_DEPTH = 2
 ) (
   input wire clk,
   input wire cpurst_b,
@@ -34,6 +35,7 @@ module edge_accel_io #(
   input wire dtcm_rd_rvalid,
   input wire [BEAT_BITS-1:0] dtcm_rd_rdata,
   output wire dtcm_wr_req,
+  output wire dtcm_wr_pair_ready, output wire dtcm_wr_last,
   input wire dtcm_wr_ready,
   output wire [ADDR_WIDTH-1:0] dtcm_wr_addr,
   output wire [BEAT_BITS-1:0] dtcm_wr_wdata,
@@ -63,7 +65,19 @@ localparam STATE_IDLE = 2'd0;
 localparam STATE_START = 2'd1;
 localparam STATE_ACTIVE = 2'd2;
 localparam BEAT_BYTES = BEAT_BITS / 8;
-localparam WR_FIFO_DEPTH = 2;
+localparam WR_PTR_BITS = $clog2(WR_FIFO_DEPTH);
+localparam RD_TAG_DEPTH = 8;
+// ACTU uses source 0. Other CMPU operands retain four-beat queues.
+localparam SRC0_BEATS = 8;
+localparam SRC_OTHER_BEATS = 4;
+function integer source_depth;
+ input integer source;
+ begin source_depth=(source==0)?SRC0_BEATS:SRC_OTHER_BEATS;end
+endfunction
+function integer source_base;
+ input integer source;
+ begin source_base=(source==0)?0:SRC0_BEATS+(source-1)*SRC_OTHER_BEATS;end
+endfunction
 
 reg [1:0] state_q;
 reg owner_q;
@@ -79,29 +93,33 @@ reg [15:0] src_issued_q [0:2];
 reg [15:0] streamed_q;
 reg [15:0] wr_committed_q;
 
-// Each source owns one 128-bit reservoir and one current-element head.
-// beat_count_q counts future elements in beat_q; head_q is a copy and is not
-// additional logical stream capacity.
-reg [BEAT_BITS-1:0] src_beat_q [0:2];
-reg [15:0] src_head_q [0:2];
-reg src_head_valid_q [0:2];
-reg [4:0] src_beat_count_q [0:2];
-reg [3:0] src_next_lane_q [0:2];
-
-reg rd_inflight_q;
-reg [1:0] rd_tag_q;
-reg [4:0] rd_elems_q;
+// Reserved beat queues hide the routed DTCM response latency.
+// Reservation includes requests in flight; a response can never overflow.
+reg [BEAT_BITS-1:0] src_data_q [0:15];
+reg [4:0] src_elems_q [0:15];
+reg [2:0] src_rd_q [0:2], src_wr_q [0:2];
+reg [3:0] src_count_q [0:2], src_reserved_q [0:2];
+reg [3:0] src_lane_q [0:2];
+wire [15:0] src_head_q [0:2];
+wire src_head_valid_q [0:2];
+wire src_pop [0:2];
+reg [1:0] rd_tags_q [0:RD_TAG_DEPTH-1];
+reg [4:0] rd_sizes_q [0:RD_TAG_DEPTH-1];
+reg [2:0] rd_head_q, rd_tail_q;
+reg [3:0] rd_count_q;
+wire [1:0] rd_tag_q = rd_tags_q[rd_head_q];
+wire [4:0] rd_elems_q = rd_sizes_q[rd_head_q];
 reg [1:0] rr_q;
 
-// Results pack directly into a beat. Two completed beats absorb DTCM stalls.
+// Results pack directly into a beat; completed beats absorb DTCM stalls.
 reg [BEAT_BITS-1:0] wr_pack_q;
 reg [4:0] wr_pack_count_q;
 reg wr_pack_pending_q;
 reg [BEAT_BITS-1:0] wr_fifo_data_q [0:WR_FIFO_DEPTH-1];
 reg [4:0] wr_fifo_elems_q [0:WR_FIFO_DEPTH-1];
-reg wr_fifo_head_q;
-reg wr_fifo_tail_q;
-reg [1:0] wr_fifo_count_q;
+reg [WR_PTR_BITS-1:0] wr_fifo_head_q;
+reg [WR_PTR_BITS-1:0] wr_fifo_tail_q;
+reg [WR_PTR_BITS:0] wr_fifo_count_q;
 reg done_q;
 
 wire start_fire = start_valid && start_ready;
@@ -109,7 +127,8 @@ wire core_start_fire = core_start_valid && core_start_ready;
 wire stream_fire = core_in_valid && core_in_ready;
 wire output_push = core_out_valid && core_out_ready;
 wire write_fire = dtcm_wr_req && dtcm_wr_ready;
-wire read_return = dtcm_rd_rvalid && rd_inflight_q;
+wire read_return = dtcm_rd_rvalid && (rd_count_q != 0);
+wire read_issue = dtcm_rd_req && dtcm_rd_ready;
 wire [4:0] dst_beat_elems = dst_is_byte_q ? 5'd16 : 5'd8;
 wire [4:0] pack_after = wr_pack_count_q + 5'd1;
 wire pack_would_complete = (pack_after == dst_beat_elems) || core_out_last;
@@ -124,8 +143,8 @@ wire [15:0] next_streamed = streamed_q + 16'd1;
 wire [16:0] reserved_outputs = {1'b0, streamed_q} -
                                {1'b0, wr_committed_q};
 // streamed-minus-committed includes results still in the fixed-latency core.
-// The pack can retain a completed beat, so all three physical beats are usable.
-wire [16:0] output_capacity = dst_is_byte_q ? 17'd48 : 17'd24;
+// Include the pack as one additional beat of physical result storage.
+wire [16:0] output_capacity = (WR_FIFO_DEPTH+1) * (dst_is_byte_q ? 16 : 8);
 wire output_capacity_available = !dst_enable_q ||
                                  (reserved_outputs < output_capacity);
 
@@ -223,6 +242,16 @@ function [15:0] beat_element;
   end
 endfunction
 
+genvar g;
+generate for(g=0;g<3;g=g+1) begin: source_head
+ wire [4:0] slot = source_base(g) + src_rd_q[g];
+ assign src_head_valid_q[g] = (src_count_q[g] != 0);
+ assign src_head_q[g] = src_head_valid_q[g] && src_enable_q[g] ?
+   beat_element(src_data_q[slot],src_is_byte_q[g],src_lane_q[g]) : 16'b0;
+ assign src_pop[g] = stream_fire && src_enable_q[g] &&
+                    ({1'b0,src_lane_q[g]}+5'd1 == src_elems_q[slot]);
+end endgenerate
+
 assign start_ready = (state_q == STATE_IDLE);
 assign busy = (state_q != STATE_IDLE);
 assign done_valid = done_q;
@@ -244,13 +273,12 @@ always @* begin
   for (s = 0; s < 3; s = s + 1) begin
     rd_eligible[s] = (state_q == STATE_ACTIVE) && src_enable_q[s] &&
                      (src_issued_q[s] < n_q) &&
-                     !(rd_inflight_q && (rd_tag_q == s[1:0])) &&
-                     (!src_head_valid_q[s] ||
-                      (src_beat_count_q[s] == 0) ||
-                      ((src_beat_count_q[s] == 1) && stream_fire) ||
-                      ((src_beat_count_q[s] == 2) && stream_fire &&
-                       (!dst_enable_q ||
-                        ((reserved_outputs + 17'd2) < output_capacity))));
+                     (src_reserved_q[s] < source_depth(s)) &&
+                     // Reserve both halves before beginning a 32-byte pair.
+                     // Otherwise freeing one slot every eight cycles defeats
+                     // adjacent-half gathering at the E4 client endpoint.
+                     (src_next_addr_q[s][1] || src_reserved_q[s] <= source_depth(s)-2 ||
+                      (n_q-src_issued_q[s] <= (src_is_byte_q[s] ? 16 : 8)));
   end
   rd_select = rr_q;
   case (rr_q)
@@ -276,9 +304,8 @@ always @* begin
 end
 
 wire any_rd_eligible = |rd_eligible;
-// A returning response releases the single tag soon enough to issue another
-// request in the same cycle.
-assign dtcm_rd_req = any_rd_eligible && (!rd_inflight_q || read_return);
+// Ordered responses retire the oldest source/length tag.
+assign dtcm_rd_req = any_rd_eligible && ((rd_count_q < RD_TAG_DEPTH) || read_return);
 assign dtcm_rd_addr = rd_select_addr;
 
 always @* begin
@@ -295,6 +322,11 @@ assign core_out_ready = (state_q == STATE_ACTIVE) && dst_enable_q &&
                         !wr_pack_pending_q;
 assign core_result_ready = (state_q == STATE_ACTIVE) && !dst_enable_q &&
                            (streamed_q == n_q);
+assign dtcm_wr_pair_ready = (wr_fifo_count_q>=2) ||
+  ((wr_fifo_count_q==1) && wr_pack_pending_q);
+assign dtcm_wr_last = ({1'b0,wr_committed_q} +
+  (wr_fifo_nonempty ? wr_fifo_elems_q[wr_fifo_head_q] :
+   wr_pack_pending_q ? wr_pack_count_q : pack_after)) == {1'b0,n_q};
 assign dtcm_wr_req = wr_fifo_nonempty || wr_pack_pending_q || direct_write;
 assign dtcm_wr_addr = dst_next_addr_q;
 assign dtcm_wr_wdata = wr_fifo_nonempty ? wr_fifo_data_q[wr_fifo_head_q] :
@@ -317,9 +349,7 @@ always @(posedge clk or negedge cpurst_b) begin
     n_q <= 16'b0;
     streamed_q <= 16'b0;
     wr_committed_q <= 16'b0;
-    rd_inflight_q <= 1'b0;
-    rd_tag_q <= 2'b0;
-    rd_elems_q <= 5'b0;
+    rd_head_q <= 0; rd_tail_q <= 0; rd_count_q <= 0;
     rr_q <= 2'b0;
     wr_pack_q <= {BEAT_BITS{1'b0}};
     wr_pack_count_q <= 5'b0;
@@ -331,11 +361,8 @@ always @(posedge clk or negedge cpurst_b) begin
     for (s = 0; s < 3; s = s + 1) begin
       src_next_addr_q[s] <= {ADDR_WIDTH{1'b0}};
       src_issued_q[s] <= 16'b0;
-      src_beat_q[s] <= {BEAT_BITS{1'b0}};
-      src_head_q[s] <= 16'b0;
-      src_head_valid_q[s] <= 1'b0;
-      src_beat_count_q[s] <= 5'b0;
-      src_next_lane_q[s] <= 4'b0;
+      src_rd_q[s] <= 0; src_wr_q[s] <= 0;
+      src_count_q[s] <= 0; src_reserved_q[s] <= 0; src_lane_q[s] <= 0;
     end
   end else begin
     done_q <= 1'b0;
@@ -353,7 +380,7 @@ always @(posedge clk or negedge cpurst_b) begin
       n_q <= n_elements;
       streamed_q <= 16'b0;
       wr_committed_q <= 16'b0;
-      rd_inflight_q <= 1'b0;
+      rd_head_q <= 0; rd_tail_q <= 0; rd_count_q <= 0;
       rr_q <= 2'b0;
       wr_pack_q <= {BEAT_BITS{1'b0}};
       wr_pack_count_q <= 5'b0;
@@ -363,11 +390,8 @@ always @(posedge clk or negedge cpurst_b) begin
       wr_fifo_count_q <= 2'b0;
       for (s = 0; s < 3; s = s + 1) begin
         src_issued_q[s] <= 16'b0;
-        src_beat_q[s] <= {BEAT_BITS{1'b0}};
-        src_head_q[s] <= 16'b0;
-        src_head_valid_q[s] <= 1'b0;
-        src_beat_count_q[s] <= 5'b0;
-        src_next_lane_q[s] <= 4'b0;
+        src_rd_q[s] <= 0; src_wr_q[s] <= 0;
+        src_count_q[s] <= 0; src_reserved_q[s] <= 0; src_lane_q[s] <= 0;
       end
       if (n_elements == 0) begin
         state_q <= STATE_IDLE;
@@ -379,54 +403,42 @@ always @(posedge clk or negedge cpurst_b) begin
       if (core_start_fire)
         state_q <= STATE_ACTIVE;
 
-      // Consume all enabled source heads in lockstep.
-      if (stream_fire) begin
-        streamed_q <= next_streamed;
-        for (s = 0; s < 3; s = s + 1) begin
-          if (src_enable_q[s]) begin
-            if (src_beat_count_q[s] != 0) begin
-              src_head_q[s] <= beat_element(src_beat_q[s],
-                                               src_is_byte_q[s],
-                                               src_next_lane_q[s]);
-              src_next_lane_q[s] <= src_next_lane_q[s] + 1'b1;
-              src_beat_count_q[s] <= src_beat_count_q[s] - 1'b1;
-            end else begin
-              src_head_valid_q[s] <= 1'b0;
-            end
-          end
+      if (stream_fire) streamed_q <= next_streamed;
+      for (s=0;s<3;s=s+1) begin
+        if (stream_fire && src_enable_q[s]) begin
+          if (src_pop[s]) begin src_lane_q[s]<=0; src_rd_q[s]<=(src_rd_q[s]==source_depth(s)-1)?0:src_rd_q[s]+1'b1; end
+          else src_lane_q[s]<=src_lane_q[s]+1'b1;
         end
-      end
-
-      if (dtcm_rd_req && dtcm_rd_ready) begin
-        rd_inflight_q <= 1'b1;
-        rd_tag_q <= rd_select;
-        rd_elems_q <= rd_select_elems;
-        src_issued_q[rd_select] <= src_issued_q[rd_select] +
-                                   {11'b0, rd_select_elems};
-        src_next_addr_q[rd_select] <= src_next_addr_q[rd_select] +
-                                      {{ADDR_WIDTH-2{1'b0}}, 2'd2};
-        rr_q <= (rd_select == 2'd2) ? 2'd0 : rd_select + 2'd1;
-      end else if (read_return) begin
-        rd_inflight_q <= 1'b0;
-      end
-
-      if (read_return) begin
-        src_beat_q[rd_tag_q] <= dtcm_rd_rdata;
-        // If the old head survives this edge, keep it and put every returned
-        // element behind it. Otherwise install lane zero directly as head.
-        if (src_head_valid_q[rd_tag_q] &&
-            !(stream_fire && src_enable_q[rd_tag_q] &&
-              (src_beat_count_q[rd_tag_q] == 0))) begin
-          src_beat_count_q[rd_tag_q] <= rd_elems_q;
-          src_next_lane_q[rd_tag_q] <= 4'd0;
-        end else begin
-          src_head_q[rd_tag_q] <= beat_element(dtcm_rd_rdata,
-                                                src_is_byte_q[rd_tag_q], 4'd0);
-          src_head_valid_q[rd_tag_q] <= 1'b1;
-          src_beat_count_q[rd_tag_q] <= rd_elems_q - 1'b1;
-          src_next_lane_q[rd_tag_q] <= 4'd1;
+        if (read_return && rd_tag_q==s) begin
+          src_data_q[source_base(s)+src_wr_q[s]] <= dtcm_rd_rdata;
+          src_elems_q[source_base(s)+src_wr_q[s]] <= rd_elems_q;
+          src_wr_q[s] <= (src_wr_q[s]==source_depth(s)-1)?0:src_wr_q[s]+1'b1;
         end
+        case ({read_return && rd_tag_q==s,src_pop[s]})
+          2'b10: src_count_q[s]<=src_count_q[s]+1'b1;
+          2'b01: src_count_q[s]<=src_count_q[s]-1'b1;
+          default: ;
+        endcase
+        case ({read_issue && rd_select==s,src_pop[s]})
+          2'b10: src_reserved_q[s]<=src_reserved_q[s]+1'b1;
+          2'b01: src_reserved_q[s]<=src_reserved_q[s]-1'b1;
+          default: ;
+        endcase
       end
+      if (read_issue) begin
+        rd_tags_q[rd_tail_q] <= rd_select;
+        rd_sizes_q[rd_tail_q] <= rd_select_elems;
+        rd_tail_q <= rd_tail_q+1'b1;
+        src_issued_q[rd_select] <= src_issued_q[rd_select]+{11'b0,rd_select_elems};
+        src_next_addr_q[rd_select] <= src_next_addr_q[rd_select]+2;
+        rr_q <= (rd_select==2) ? 0 : rd_select+1'b1;
+      end
+      if (read_return) rd_head_q <= rd_head_q+1'b1;
+      case ({read_issue,read_return})
+        2'b10: rd_count_q<=rd_count_q+1'b1;
+        2'b01: rd_count_q<=rd_count_q-1'b1;
+        default: ;
+      endcase
 
       if (output_push) begin
         if (make_pending) begin
@@ -442,8 +454,8 @@ always @(posedge clk or negedge cpurst_b) begin
             wr_pack_count_q <= 5'b0;
             wr_pack_pending_q <= 1'b0;
           end else begin
-            // Both completed slots are occupied.  The pack itself is the
-            // third pending beat until an older FIFO entry drains.
+            // All completed slots are occupied. The pack retains this
+            // final reserved beat until an older FIFO entry drains.
             wr_pack_q <= pack_after_data;
             wr_pack_count_q <= pack_after;
             wr_pack_pending_q <= 1'b1;
@@ -490,4 +502,16 @@ end
 
 wire unused_fifo_parameters = (FIFO_DEPTH == 0) || (FIFO_INDEX_WIDTH == 0);
 
+`ifndef SYNTHESIS
+initial if(WR_FIFO_DEPTH<2 || (WR_FIFO_DEPTH & (WR_FIFO_DEPTH-1))!=0)
+  $fatal(1,"WR_FIFO_DEPTH must be a power of two >=2");
+integer check_s;
+always @(posedge clk) if(cpurst_b) begin
+  if(dtcm_rd_rvalid && rd_count_q==0) $fatal(1,"unowned DTCM response");
+  if(rd_count_q>RD_TAG_DEPTH) $fatal(1,"read tag overflow");
+  for(check_s=0;check_s<3;check_s=check_s+1)
+    if(src_count_q[check_s]>src_reserved_q[check_s] || src_reserved_q[check_s]>source_depth(check_s))
+      $fatal(1,"source credit overflow");
+end
+`endif
 endmodule
