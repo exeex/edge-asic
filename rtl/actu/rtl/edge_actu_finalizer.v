@@ -35,7 +35,7 @@ edge_actu_finalizer_classified #(.POST_STAGES(POST_STAGES)) core (
  .clk(clk),.cpurst_b(cpurst_b),.in_valid(in_valid),.in_last(in_last),
  .in_mode(in_mode),.in_payload_bf19(in_payload_bf19),
  .in_primary_bf22(in_primary_bf22),.in_rcp_bf22(in_rcp_bf22),
- .in_result_action(3'd0),
+ .in_result_action(4'd0),
  .in_payload_class(classify({in_payload_bf19,3'b0})),
  .in_primary_class(classify(in_primary_bf22)),.in_rcp_class(classify(in_rcp_bf22)),
  .in_primary_operand(22'b0),.in_payload_operand(22'b0),.in_rcp_operand(22'b0),
@@ -66,7 +66,7 @@ module edge_actu_finalizer_classified #(
   input  wire [18:0] in_payload_bf19,
   input  wire [21:0] in_primary_bf22,
   input  wire [21:0] in_rcp_bf22,
-  input  wire [2:0]  in_result_action,
+  input  wire [3:0]  in_result_action,
   input  wire [2:0]  in_primary_class, in_payload_class, in_rcp_class,
   input wire [21:0] in_primary_operand, in_payload_operand, in_rcp_operand,
   input  wire        in_sum_clear,
@@ -158,10 +158,6 @@ wire [2:0] bypass_class = ((mul2_mode_q==EDGE_ACTU_MODE_SIGMOID) ||
 wire [24:0] packed1, packed3;
 wire [2:0] final_class = (final_mode_q==EDGE_ACTU_MODE_SILU) ?
                        packed3[24:22] : final_bypass_class;
-function exponent_zero;
- input [2:0] c;
- begin exponent_zero=(c==3'd1)||(c==3'd2); end
-endfunction
 function special_class;
  input [2:0] c;
  begin special_class=(c==3'd4)||(c==3'd5); end
@@ -250,8 +246,7 @@ endfunction
 // Prepared operand is {effective biased exponent, hidden bit, fraction}.
 function [21:0] prepare_operand;
  input [21:0] b;
- input [2:0] c;
- begin prepare_operand={exponent_zero(c)?8'd1:b[20:13],!exponent_zero(c),b[12:0]};end
+ begin prepare_operand={b[20:13]==0?8'd1:b[20:13],(b[20:13]!=0),b[12:0]};end
 endfunction
 reg [21:0] relay_primary_operand,relay_payload_operand,relay_rcp_operand;
 reg [21:0] partial_payload_operand,mul1_payload_operand,mul2_payload_operand;
@@ -262,9 +257,9 @@ wire [23:0] rounded3=round_product(mul3_exp_q,mul3_product_q);
 wire semantic_sign1=(!mul1_zero_q && mul1_special_q)?1'b0:mul1_sign_q;
 wire semantic_sign3=(!mul3_zero_q && mul3_special_q)?1'b0:mul3_sign_q;
 always @(posedge clk)begin
- relay_primary_operand<=PREPARED_INPUTS?in_primary_operand:prepare_operand(in_primary_bf22,in_primary_class);
- relay_payload_operand<=PREPARED_INPUTS?in_payload_operand:prepare_operand({in_payload_bf19,3'b0},in_payload_class);
- relay_rcp_operand<=PREPARED_INPUTS?in_rcp_operand:prepare_operand(in_rcp_bf22,in_rcp_class);
+ relay_primary_operand<=PREPARED_INPUTS?in_primary_operand:prepare_operand(in_primary_bf22);
+ relay_payload_operand<=PREPARED_INPUTS?in_payload_operand:prepare_operand({in_payload_bf19,3'b0});
+ relay_rcp_operand<=PREPARED_INPUTS?in_rcp_operand:prepare_operand(in_rcp_bf22);
  partial_payload_operand<=relay_payload_operand;
  mul1_payload_operand<=partial_payload_operand;
  mul2_payload_operand<=mul1_payload_operand;
@@ -326,7 +321,9 @@ assign mul3_product_bf22 = packed3[21:0];
 assign packed3={product_class(mul3_zero_q,mul3_special_q,rounded3[23],rounded3[22]),
                 semantic_sign3,rounded3[21:14],rounded3[12:0]};
 
+// SiLU does not consume this bypass numerically. Reuse it for its input rail.
 assign stage3_bypass_bf22 =
+    (mul2_mode_q == EDGE_ACTU_MODE_SILU) ? {mul2_payload_q,3'b0} :
     (mul2_mode_q == EDGE_ACTU_MODE_SIGMOID) ? mul2_product_bf22_q :
     ((mul2_mode_q == EDGE_ACTU_MODE_TANH) ?
        {mul2_payload_q[18], mul2_product_bf22_q[20:0]} :
@@ -335,32 +332,41 @@ assign stage3_bypass_bf22 =
 assign final_result_bf22 = (final_mode_q == EDGE_ACTU_MODE_SILU) ?
                            mul3_product_bf22 : final_bypass_bf22_q;
 wire [15:0] finite_result=bf22_to_bf16(final_result_bf22);
-// The only special-result materialization in the integrated finalizer.
-wire [15:0] selected_result=(final_class==3'd1)?{final_result_bf22[21],15'b0}:
-                           (final_class==3'd5)?16'h7fc0:
-                           (final_class==3'd4)?{final_result_bf22[21],8'hff,7'b0}:finite_result;
 // Entry semantics are resolved before the existing output capture, not after it.
-reg [2:0] result_action_q[0:5];
+reg [3:0] result_action_q[0:5];
+reg [5:0] rcp_zero_q;
+reg action_sign_p, action_sign_q;
 integer result_action_stage;
 always @(posedge clk)begin
+ rcp_zero_q<={rcp_zero_q[4:0],in_rcp_class==3'd1};
  result_action_q[0]<=in_result_action;
  for(result_action_stage=1;result_action_stage<6;result_action_stage=result_action_stage+1)
   result_action_q[result_action_stage]<=result_action_q[result_action_stage-1];
 end
 function [15:0] action_bits;
- input [2:0] action;
+ input [3:0] action;
  begin
   case(action)
    1:action_bits=16'h0000; 2:action_bits=16'h8000;
    3:action_bits=16'h3f80; 4:action_bits=16'hbf80;
    5:action_bits=16'h7f80; 6:action_bits=16'hff80;
+   8:action_bits=final_bypass_bf22_q[21:6];
+   9:action_bits=16'h1f80; // RSQRT of the established maximum-finite saturation.
+   10:action_bits=16'h7ef8; // Established EXP(+88) finite clamp.
    default:action_bits=16'h7fc0;
   endcase
  end
 endfunction
-wire [15:0] policy_result=INPUT_POLICY && result_action_q[5]!=0 ?
-                         action_bits(result_action_q[5]) : selected_result;
-assign final_result_bits={policy_result,16'b0};
+// Merge entry/generated policy with numerical result status first. A single
+// output selection materializes the semantic result; it never feeds arithmetic.
+wire zero_sign=INPUT_POLICY && (final_mode_q==3'd1 || final_mode_q==3'd6) ? 1'b0 :
+               INPUT_POLICY && final_mode_q==3'd7 && rcp_zero_q[5] ? action_sign_q : final_result_bf22[21];
+wire [3:0] numeric_action=final_class==3'd1 ? (zero_sign?4'd2:4'd1) :
+                          final_class==3'd4 ? (final_result_bf22[21]?4'd6:4'd5) :
+                          final_class==3'd5 ? 4'd7 : 4'd0;
+wire [3:0] merged_action=INPUT_POLICY && result_action_q[5]!=0 ?
+                         result_action_q[5] : numeric_action;
+assign final_result_bits={merged_action==0 ? finite_result : action_bits(merged_action),16'b0};
 
 generate if(!EXTERNAL_RSUM)begin: internal_rsum
 edge_actu_softmax_rsum x_softmax_rsum (
@@ -431,6 +437,8 @@ always @(posedge clk) begin
     mul2_product_bf22_q <= mul1_product_bf22;
 
     // M3P: second pair of 14x7 partials for SiLU; other modes relay.
+    action_sign_p<=mul2_payload_q[18];
+    action_sign_q<=action_sign_p;
     mul3_partial_bypass_bf22_q <= stage3_bypass_bf22;
     mul3_partial_sign_q <= mul3_sign;
     mul3_partial_zero_q <= mul3_zero;
@@ -466,14 +474,14 @@ endfunction
 always @(posedge clk) if(cpurst_b) begin
  if(in_valid && PREPARED_INPUTS &&
     ({in_primary_operand,in_payload_operand,in_rcp_operand} !==
-     {prepare_operand(in_primary_bf22,in_primary_class),
-      prepare_operand({in_payload_bf19,3'b0},in_payload_class),
-      prepare_operand(in_rcp_bf22,in_rcp_class)}))
+     {prepare_operand(in_primary_bf22),
+      prepare_operand({in_payload_bf19,3'b0}),
+      prepare_operand(in_rcp_bf22)}))
   $fatal(1,"finalizer prepared operand alignment mismatch");
- // Primary and reciprocal ZERO can carry nonzero magnitude candidates. Standalone
+ // Primary ZERO/INF and reciprocal ZERO can carry arbitrary candidates. Standalone
  // raw callers remain checked exactly; integrated prepared callers use class.
  if(in_valid && (({in_primary_class,in_payload_class} !==
-   {(PREPARED_INPUTS && in_primary_class==3'd1 ? 3'd1 : observed_class(in_primary_bf22)),(FINITE_INPUTS && in_payload_bf19[17:10]==255 ? 3'd0 : observed_class({in_payload_bf19,3'b0}))}) ||
+   {(PREPARED_INPUTS && (in_primary_class==3'd1 || in_primary_class==3'd3 || in_primary_class==3'd4) ? in_primary_class : observed_class(in_primary_bf22)),(INPUT_POLICY ? (in_payload_bf19[17:0]==0 ? 3'd1 : 3'd0) : (FINITE_INPUTS && in_payload_bf19[17:10]==255 ? 3'd0 : observed_class({in_payload_bf19,3'b0})))}) ||
    ((!PREPARED_INPUTS || in_rcp_class!=3'd1) &&
     in_rcp_class !== observed_class(in_rcp_bf22))))
   $fatal(1,"finalizer input class mismatch");

@@ -3,13 +3,14 @@
 // West-side ACTU frontend. EXP and the fused native-BF22 numerator /
 // denominator transform stay behind a registered physical boundary.
 (* keep_hierarchy = "yes" *)
-module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0) (
+module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0, parameter RANGE_STATUS=0, parameter OUTPUT_POLICY=0, parameter PRECLASSIFIED_INPUT=0) (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
   input  wire        in_last,
   input  wire [2:0]  in_mode,
   input  wire [15:0] in_value_bf16,
+  input wire in_value_zero,
   input  wire [21:0] in_scalar_bf22,
   input  wire        in_sum_clear,
   input  wire exp_underflow,
@@ -25,10 +26,12 @@ module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0) (
   output reg  [2:0]  out_primary_class,
   output reg  [2:0]  out_divisor_class,
   output reg  [2:0]  out_payload_class,
-  output reg  [21:0] out_divisor_bf22
+  output reg  [21:0] out_divisor_bf22,
+  input wire exp_overflow, exp_clamped,
+  output reg [3:0] out_result_action
 );
 
-// Class encoding: normal=0, zero=1, subnormal=2, infinity=4, NaN=5.
+// Class: normal=0, zero=1, subnormal=2, deferred finite rail=3, Inf=4, NaN=5.
 // Divisor class is consumed by the nonlinear core; primary/payload classes
 // travel to the finalizer. Arithmetic and special-case priorities are unchanged.
 wire [2:0] exp_class, input_class, scalar_class;
@@ -37,14 +40,24 @@ reg [2:0] exp_class_s0, exp_class_s1, exp_class_s2;
 reg [2:0] payload_class_s0, payload_class_s1, payload_class_s2;
 reg [2:0] scalar_class_s0, scalar_class_s1, scalar_class_s2;
 reg [2:0] den_class_s2, add_class_s2;
-edge_actu_bf22_classify classify_exp(exp_lut_bf22,exp_class);
-edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_input({in_value_bf16,6'b0},input_class);
-edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_scalar(in_scalar_bf22,scalar_class);
+wire [2:0] exp_packed_class;
+assign exp_class=exp_underflow ? 3'd1 :
+                 (RANGE_STATUS && exp_overflow) ? 3'd4 :
+                 (OUTPUT_POLICY && exp_clamped) ? 3'd3 : exp_packed_class;
+generate if(OUTPUT_POLICY)begin: compact_input_status
+ // Only payload ZERO is consumed downstream. No repeated raw classification.
+ assign input_class=(PRECLASSIFIED_INPUT ? in_value_zero : in_value_bf16[14:0]==0) ? 3'd1 : 3'd0;
+ assign scalar_class=3'd0; // Integrated nonlinear core never consumes input class.
+end else begin: compatibility_input_status
+ edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_input({in_value_bf16,6'b0},input_class);
+ edge_actu_bf22_classify #(.FINITE_INPUTS(FINITE_INPUTS)) classify_scalar(in_scalar_bf22,scalar_class);
+end endgenerate
 // The 1+e pack always emits exponent 127..129, including arbitrary raw bits.
 assign den_class=3'd0;
-wire [2:0] add_candidate_class;
-edge_actu_bf22_classify #(.FINITE_INPUTS(1)) classify_add(bypass_add_bf22_s2,add_candidate_class);
-assign add_class=(bypass_add_raw_s1_q==0)?3'd1:add_candidate_class;
+// Positive-add pack produces numerical class directly from RNE/exponent state.
+wire [24:0] add_packet_s2;
+assign add_class=(!OUTPUT_POLICY && add_packet_s2[24:22]==3'd3)?3'd0:add_packet_s2[24:22];
+assign bypass_add_bf22_s2=(!OUTPUT_POLICY && add_packet_s2[24:22]==3'd3)?22'h1fdfff:add_packet_s2[21:0];
 assign numerator_class=(tanh_num_raw_s2==0)?3'd1:3'd0;
 
 localparam [2:0] EDGE_ACTU_MODE_RCP_ONLY = 3'd1;
@@ -58,7 +71,6 @@ localparam [18:0] BF22_ONE_EXT = {14'h2000, 5'b0};
 
 wire [28:0] exp_product_q28;
 wire [21:0] exp_packed_bf22;
-wire [21:0] exp_lut_bf22;
 wire [18:0] aligned_e_s1;
 wire [19:0] den_raw_s1;
 wire [18:0] tanh_num_raw_s1;
@@ -219,13 +231,18 @@ function [21:0] pack_num_bf22;
   end
 endfunction
 
-function [21:0] pack_positive_add_bf22;
+function [24:0] pack_positive_add_classified;
   input [19:0] raw;
   input [7:0] base_exp;
   reg [7:0] exp_bits;
   reg [18:0] norm;
   reg [13:0] main;
   reg [14:0] rounded;
+  reg [7:0] rounded_exp;
+  reg [12:0] fraction;
+  reg saturated;
+  reg [2:0] result_class;
+  reg [21:0] candidate;
   begin
     begin // Unconditional numeric candidate; ZERO travels in add_class.
       if (raw[19]) begin
@@ -238,14 +255,19 @@ function [21:0] pack_positive_add_bf22;
       main = norm[18:5];
       rounded = {1'b0, main} +
                 (norm[4] && (|norm[3:0] || main[0]));
-      if (exp_bits == 8'hff ||
-          (exp_bits == 8'hfe && rounded[14]))
-        pack_positive_add_bf22 = 22'h1fdfff;
-      else if (rounded[14])
-        pack_positive_add_bf22 = {1'b0, exp_bits + 1'b1,
-                                  rounded[13:1]};
-      else
-        pack_positive_add_bf22 = {1'b0, exp_bits, rounded[12:0]};
+      // Preserve the established 8-bit exponent and finite saturation policy.
+      // This is generated arithmetic overflow, not an input-special decoder.
+      saturated=(exp_bits == 8'hff) || (exp_bits == 8'hfe && rounded[14]);
+      rounded_exp=exp_bits + {7'b0,rounded[14]};
+      // Effective exponent one includes subnormals: restore stored exponent
+      // zero unless RNE has reached the normal hidden bit.
+      if (exp_bits==8'd1 && !rounded[14] && !rounded[13]) rounded_exp=0;
+      fraction=rounded[14] ? rounded[13:1] : rounded[12:0];
+      candidate={1'b0,rounded_exp,fraction};
+      result_class=(raw==0) ? 3'd1 : saturated ? 3'd3 :
+                   rounded_exp==0 ? ((fraction==0) ? 3'd1 : 3'd2) : 3'd0;
+      // SATURATED operand status is consumed only by the output-action sideband.
+      pack_positive_add_classified={result_class,candidate};
     end
   end
 endfunction
@@ -300,18 +322,21 @@ end
 
 // F0: G6 already captured the lookup and residual multiplication.
 assign exp_product_q28={exp_hi,14'b0}+{8'b0,exp_residual_product};
-edge_actu_exp2_pack_q28_bf22 x_exp_pack (
+edge_actu_exp2_pack_q28_bf22_classified x_exp_pack (
   .exp2_k(exp2_k), .mant_product_q28(exp_product_q28),
-  .value_bf22(exp_packed_bf22)
+  .candidate_bf22(exp_packed_bf22),.value_class(exp_packed_class)
 );
-assign exp_lut_bf22 = exp_underflow ? 22'b0 : exp_packed_bf22;
-assign aligned_e_s1 = align_to_one_grs(exp_s0);
+// Consume EXP status at the narrow alignment boundary; candidate runs freely.
+// OUTPUT_POLICY removes all status control from numerical alignment.
+assign aligned_e_s1 = OUTPUT_POLICY ? align_to_one_grs(exp_s0) :
+                      exp_class_s0==3'd1 ? 19'b0 :
+                      exp_class_s0==3'd4 ? BF22_ONE_EXT : align_to_one_grs(exp_s0);
 assign den_raw_s1 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1};
 // align_to_one_grs is proven <= ONE_EXT for all BF22 encodings.
 assign tanh_num_raw_s1 = BF22_ONE_EXT - aligned_e_s1;
 assign tanh_num_lzc_s2 = lzc19(tanh_num_raw_s1_q);
 assign den_bf22_s2 = pack_den_bf22(den_raw_s1_q);
-assign bypass_add_bf22_s2 = pack_positive_add_bf22(
+assign add_packet_s2 = pack_positive_add_classified(
                               bypass_add_raw_s1_q,
                               bypass_add_exp_s1_q);
 assign tanh_num_bf22_s3 = pack_num_bf22(tanh_num_raw_s2,
@@ -355,7 +380,7 @@ always @(posedge clk) begin
     // F0: EXP output boundary.
     mode_s0 <= in_mode;
     payload_bf19_s0 <= {in_value_bf16,3'b0};
-    exp_s0 <= exp_lut_bf22;
+    exp_s0 <= exp_packed_bf22;
 
     scalar_bf22_s0 <= in_scalar_bf22;
 
@@ -412,7 +437,23 @@ always @(posedge clk) begin
   scalar_class_s0<=scalar_class;scalar_class_s1<=scalar_class_s0;scalar_class_s2<=scalar_class_s1;
   den_class_s2<=den_class;add_class_s2<=add_class;
   out_payload_class<=payload_class_s2;
-  if(mode_s2==EDGE_ACTU_MODE_RCP_ONLY)out_divisor_class<=payload_class_s2;
+  // Output policy combines generated state with mode; it never drives arithmetic.
+  out_result_action<=0;
+  if(OUTPUT_POLICY)begin
+    if(mode_s2==3'd6 && add_class_s2==3'd3)out_result_action<=4'd9;
+    else if(mode_s2==3'd0 || mode_s2==3'd5)begin
+      if(exp_class_s2==3'd3)out_result_action<=4'd10;
+    end else if(exp_class_s2==3'd1)begin
+      case(mode_s2)
+        3'd2:out_result_action<=payload_bf19_s2[18]?4'd1:4'd3;
+        3'd3:out_result_action<=payload_bf19_s2[18]?4'd2:4'd8;
+        3'd4:out_result_action<=payload_bf19_s2[18]?4'd4:4'd3;
+        default:out_result_action<=0;
+      endcase
+    end
+  end
+  if(OUTPUT_POLICY)out_divisor_class<=3'd0;
+  else if(mode_s2==EDGE_ACTU_MODE_RCP_ONLY)out_divisor_class<=payload_class_s2;
   else if(mode_s2==EDGE_ACTU_MODE_RSQRT)
     out_divisor_class<=(!FINITE_INPUTS && value_bf22_s2[21]) ? payload_class_s2 : add_class_s2;
   else if(mode_s2==EDGE_ACTU_MODE_SOFTMAX_NORMALIZE)out_divisor_class<=scalar_class_s2;

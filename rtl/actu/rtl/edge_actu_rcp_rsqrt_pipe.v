@@ -154,11 +154,11 @@ assign result_fraction = normalized_result[15:3];
 wire result_zero=invalid_s6 || biased_exp <= 0;
 assign out_value_class = result_zero ? 3'd1 : 3'd0;
 assign out_valid = valid_s6;
-// Keep the legacy positive-zero sign in the semantic sign bit. This one-bit
-// control never gates the exponent/fraction datapath. With the current
+// Candidate sign is unconditional; ZERO has positive semantic sign only at
+// the terminal output merge. With the current
 // exponent preparation, biased_exp <= 254 (RCP) or <= 191 (RSQRT); the former
 // overflow-saturation branch is unreachable for every accepted BF22 input.
-wire result_sign=sign_s6 && !result_zero;
+wire result_sign=sign_s6;
 assign out_value_bf22 = {result_sign,biased_exp[7:0],result_fraction};
 
 // Only validity is cancellation state. Numeric-domain flags are packet data.

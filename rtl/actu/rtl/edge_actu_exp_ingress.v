@@ -16,13 +16,17 @@ module edge_actu_exp_ingress (
   output reg [20:0] out_residual_product,
   output reg [14:0] out_hi,
   output reg [5:0] out_residual,
-  output reg [11:0] out_frac_code
+  output reg [11:0] out_frac_code,
+  output reg out_overflow, out_clamped
 );
-wire [15:0] delta_bf16, delta_before_capture;
+wire [15:0] delta_candidate;
 reg [18:0] magnitude_q;
 reg prepared_sign_q, prepared_underflow_q;
-wire delta_valid;
+wire delta_overflow;
+reg prepared_overflow_q, overflow_q, prepared_clamp_q, clamp_q;
 reg [21:0] native_operand_q [0:4];
+reg [3:0] scale_overflow_q;
+wire [8:0] scale_exponent={1'b0,in_value_bf16[14:7]}+9'd1;
 reg [15:0] range_low_q;
 reg [23:0] range_high_q;
 reg sign_q, underflow_q;
@@ -36,12 +40,15 @@ function [21:0] native_exp_operand;
   input [15:0] value;
   input [2:0] mode;
   reg [15:0] scaled;
+  reg [7:0] doubled_exponent;
   begin
     scaled={1'b1,value[14:0]};
-    if (mode==3'd4 && value[14:0]!=0) begin
-      if (value[14:7]<8'hfe) scaled={1'b1,value[14:7]+8'd1,value[6:0]};
-      else scaled=16'hff80;
-    end
+    doubled_exponent=value[14:7]+8'd1;
+    // Multiply magnitude by two; subnormal significands shift normally.
+    // Extended-exponent overflow travels separately, never materialized as Inf.
+    if (mode==3'd4)
+      scaled=value[14:7]==0 ? {1'b1,7'b0,value[6:0],1'b0} :
+                             {1'b1,doubled_exponent,value[6:0]};
     if (mode==3'd2 || mode==3'd3 || mode==3'd4) native_exp_operand={scaled,6'b0};
     else native_exp_operand={value,6'b0};
   end
@@ -50,16 +57,17 @@ endfunction
 edge_actu_softmax_sub_bf16_pipe x_subtract (
   .clk(clk),.cpurst_b(cpurst_b),.in_valid(in_valid),
   .value_bf16(in_value_bf16),.max_bf16(in_scalar_bits[31:16]),
-  .out_valid(delta_valid),.delta_bf16(delta_bf16),.delta_before_capture(delta_before_capture)
+  .out_valid(),.delta_bf16(),.delta_before_capture(),
+  .overflow_before_capture(delta_overflow),.candidate_before_capture(delta_candidate)
 );
-wire range_underflow, range_sign;
+wire range_underflow, range_sign, range_clamp;
 wire [18:0] range_magnitude;
 wire signed [9:0] range_k;
 wire [11:0] range_frac;
 // G4 selects/prepares Q12. G5 only computes constant partial products.
-edge_actu_exp_range_bf22_prepare x_range_prepare (
-  .value_bf22(mode_q[3]==3'd5 ? {delta_before_capture,6'b0} : native_operand_q[3]),
-  .underflow(range_underflow),.sign_z(range_sign),.magnitude_q12(range_magnitude)
+edge_actu_exp_range_bf22_prepare_numeric #(.FREE_RUN(1)) x_range_prepare (
+  .value_bf22(mode_q[3]==3'd5 ? {delta_candidate,6'b0} : native_operand_q[3]),
+  .underflow(range_underflow),.sign_z(range_sign),.magnitude_q12(range_magnitude),.clamp_high(range_clamp)
 );
 // 23637 = 85 + (23 << 10). Low ten product bits cannot carry into bit ten.
 wire [25:0] range_low=magnitude_q*7'd85;
@@ -77,9 +85,15 @@ always @(posedge clk) begin
   out_hi<=range_hi;out_residual<=range_residual;
   out_residual_product<=range_hi*range_residual;
   native_operand_q[0]<=native_exp_operand(in_value_bf16,in_mode);
+  scale_overflow_q<={scale_overflow_q[2:0],in_mode==3'd4 && scale_exponent>=9'd255};
   for(stage=1;stage<5;stage=stage+1)native_operand_q[stage]<=native_operand_q[stage-1];
   range_low_q<=range_low[25:10]; range_high_q<=range_high; sign_q<=prepared_sign_q; underflow_q<=prepared_underflow_q;
-  magnitude_q<=range_magnitude;prepared_sign_q<=range_sign && (|range_magnitude);prepared_underflow_q<=range_underflow;
+  // Overflow is produced by subtraction/RNE, never predicted from input class.
+  prepared_overflow_q<=mode_q[3]==3'd5 && delta_overflow && !delta_candidate[15];
+  overflow_q<=prepared_overflow_q;
+  prepared_clamp_q<=range_clamp;clamp_q<=prepared_clamp_q;out_clamped<=clamp_q;
+  magnitude_q<=range_magnitude;prepared_sign_q<=range_sign && (|range_magnitude);prepared_underflow_q<=range_underflow ||
+    (mode_q[3]==3'd5 && delta_overflow && delta_candidate[15]) || scale_overflow_q[3];
   mode_q[0]<=in_mode;
   value_q[0]<=in_value_bf16;
   // Only normalize carries an internal BF22 sum. External max/epsilon are BF16.
@@ -89,7 +103,7 @@ always @(posedge clk) begin
   end
   out_mode<=mode_q[5]; out_value_bf16<=value_q[5];
   out_scalar_bf22<=scalar_q[5];
-  out_underflow<=underflow_q; out_exp2_k<=range_k; out_frac_code<=range_frac;
+  out_underflow<=underflow_q; out_exp2_k<=range_k; out_overflow<=overflow_q; out_frac_code<=range_frac;
 end
 always @(posedge clk or negedge cpurst_b)
   if (!cpurst_b) begin

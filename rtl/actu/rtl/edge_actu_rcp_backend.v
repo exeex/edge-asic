@@ -57,14 +57,14 @@ reg [2:0] egress_primary_class_q, egress_payload_class_q;
 assign out_primary_class=egress_primary_class_q;
 assign out_payload_class=egress_payload_class_q;
 function [21:0] prepare_operand;
- input [21:0] b;input [2:0] c;
+ input [21:0] b;
  reg ez;
- begin ez=(c==1)||(c==2);prepare_operand={ez?8'd1:b[20:13],!ez,b[12:0]};end
+ begin ez=(b[20:13]==0);prepare_operand={ez?8'd1:b[20:13],!ez,b[12:0]};end
 endfunction
 always @(posedge clk)begin
- out_primary_operand<=prepare_operand(primary_pipe[ALIGN_LATENCY-1],primary_class_pipe[ALIGN_LATENCY-1]);
- out_payload_operand<=prepare_operand({payload_pipe[ALIGN_LATENCY-1],3'b0},payload_class_pipe[ALIGN_LATENCY-1]);
- out_rcp_operand<=prepare_operand(nonlinear_bf22,nonlinear_class);
+ out_primary_operand<=prepare_operand(primary_pipe[ALIGN_LATENCY-1]);
+ out_payload_operand<=prepare_operand({payload_pipe[ALIGN_LATENCY-1],3'b0});
+ out_rcp_operand<=prepare_operand(nonlinear_bf22);
 end
 integer stage;
 
@@ -151,7 +151,7 @@ always @(posedge clk) begin
 end
 
 `ifndef SYNTHESIS
-// Independent observer for materialized classes. ZERO candidates may carry
+// Independent observer for materialized classes. ZERO/INF EXP candidates may carry
 // arbitrary magnitude; end-to-end equivalence tests verify their semantic class.
 function [2:0] expected_class;
   input [21:0] bits;
@@ -166,7 +166,7 @@ function [2:0] expected_class;
 endfunction
 function [2:0] expected_input_class;
  input [21:0] bits;
- begin expected_input_class=(FINITE_INPUTS && bits[20:13]==255)?3'd0:expected_class(bits);end
+ begin expected_input_class=FINITE_INPUTS ? (bits[20:0]==0 ? 3'd1 : 3'd0) : expected_class(bits);end
 endfunction
 wire class_invalid=(ingress_divisor_class_q==3'd1)||
                    (ingress_divisor_class_q==3'd4)||
@@ -174,11 +174,11 @@ wire class_invalid=(ingress_divisor_class_q==3'd1)||
                    ((ingress_mode_q==EDGE_ACTU_MODE_RSQRT)&&ingress_divisor_q[21]);
 always @(posedge clk) if(cpurst_b)begin
   if(in_valid && ({in_primary_class,in_divisor_class,in_payload_class} !==
-    {(in_primary_class==3'd1 ? 3'd1 : expected_class(in_primary_bf22)),(in_divisor_class==3'd1 ? 3'd1 : expected_input_class(in_divisor_bf22)),expected_input_class({in_payload_bf19,3'b0})}))
+    {((in_primary_class==3'd1 || in_primary_class==3'd3 || in_primary_class==3'd4) ? in_primary_class : expected_class(in_primary_bf22)),((FINITE_INPUTS || in_divisor_class==3'd1 || in_divisor_class==3'd3) ? in_divisor_class : expected_input_class(in_divisor_bf22)),expected_input_class({in_payload_bf19,3'b0})}))
     $fatal(1,"ACTU frontend class/data mismatch");
   if(ingress_valid_q)begin
     if({ingress_primary_class_q,ingress_divisor_class_q,ingress_payload_class_q} !==
-       {(ingress_primary_class_q==3'd1 ? 3'd1 : expected_class(ingress_primary_q)),(ingress_divisor_class_q==3'd1 ? 3'd1 : expected_input_class(ingress_divisor_q)),expected_input_class({ingress_payload_q,3'b0})})
+       {((ingress_primary_class_q==3'd1 || ingress_primary_class_q==3'd3 || ingress_primary_class_q==3'd4) ? ingress_primary_class_q : expected_class(ingress_primary_q)),((FINITE_INPUTS || ingress_divisor_class_q==3'd1 || ingress_divisor_class_q==3'd3) ? ingress_divisor_class_q : expected_input_class(ingress_divisor_q)),expected_input_class({ingress_payload_q,3'b0})})
       $fatal(1,"ACTU backend ingress class/data mismatch");
     if(!FINITE_INPUTS && ingress_divisor_class_q!=3'd1 && class_invalid !== ((ingress_divisor_q[20:0]==0) ||
        (ingress_divisor_q[20:13]==8'hff) ||
@@ -186,11 +186,10 @@ always @(posedge clk) if(cpurst_b)begin
       $fatal(1,"ACTU class-derived nonlinear case differs from existing decode");
   end
   if(out_valid && ((out_rcp_class==3'd0 && expected_class(out_rcp_bf22)!=3'd0) ||
-     (out_rcp_class==3'd1 && out_rcp_bf22[21]) ||
      (out_rcp_class!=3'd0 && out_rcp_class!=3'd1)))
     $fatal(1,"ACTU reciprocal result class/data mismatch");
   if(out_valid && ({out_primary_class,out_payload_class} !==
-     {(out_primary_class==3'd1 ? 3'd1 : expected_class(out_primary_bf22)),expected_input_class({out_payload_bf19,3'b0})}))
+     {((out_primary_class==3'd1 || out_primary_class==3'd3 || out_primary_class==3'd4) ? out_primary_class : expected_class(out_primary_bf22)),expected_input_class({out_payload_bf19,3'b0})}))
     $fatal(1,"ACTU backend egress class/data mismatch");
 end
 `endif

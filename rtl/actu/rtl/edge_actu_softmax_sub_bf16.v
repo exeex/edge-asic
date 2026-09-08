@@ -5,13 +5,18 @@ module edge_actu_softmax_sub_bf16 (
   input wire [15:0] value_bf16, max_bf16,
   output wire [15:0] delta_bf16
 );
-wire [56:0] decoded;
-wire [48:0] aligned;
-wire [37:0] sum_packet;
+wire [39:0] decoded;
+wire [31:0] aligned;
+wire [20:0] sum_packet;
 edge_actu_softmax_sub_decode x_decode(value_bf16,max_bf16,decoded);
 edge_actu_softmax_sub_align x_align(decoded,aligned);
 edge_actu_softmax_sub_add x_add(aligned,sum_packet);
-edge_actu_softmax_sub_pack x_pack(sum_packet,delta_bf16);
+wire [15:0] numeric_delta;
+edge_actu_softmax_sub_pack x_pack(sum_packet,numeric_delta);
+// Standalone compatibility policy; never carried through the ingress pipe.
+assign delta_bf16=value_bf16[14:0]==0 ? {~max_bf16[15],max_bf16[14:0]} :
+                  max_bf16[14:0]==0 ? value_bf16 :
+                  (&value_bf16[14:7]) || (&max_bf16[14:7]) ? 16'h7fc0 : numeric_delta;
 endmodule
 
 // Five captures: decode, coarse/fine alignment, add+normalize, RNE.
@@ -20,25 +25,27 @@ module edge_actu_softmax_sub_bf16_pipe (
   input wire [15:0] value_bf16, max_bf16,
   output wire out_valid,
   output reg [15:0] delta_bf16,
-  output wire [15:0] delta_before_capture
+  output wire [15:0] delta_before_capture,
+  output wire overflow_before_capture,
+  output wire [15:0] candidate_before_capture
 );
-wire [56:0] decoded;
-wire [48:0] aligned;
-wire [37:0] sum_packet;
+wire [39:0] decoded;
+wire [31:0] aligned;
+wire [20:0] sum_packet;
 wire [15:0] packed_value;
-wire [50:0] coarse;
-reg [50:0] coarse_q;
-reg [56:0] decoded_q;
-reg [48:0] aligned_q;
-wire [38:0] normalized_packet;
-reg [38:0] normalized_q;
+wire [33:0] coarse;
+reg [33:0] coarse_q;
+reg [39:0] decoded_q;
+reg [31:0] aligned_q;
+wire [21:0] normalized_packet;
+reg [21:0] normalized_q;
 reg [4:0] valid_q;
 edge_actu_softmax_sub_decode x_decode(value_bf16,max_bf16,decoded);
 edge_actu_softmax_sub_align_coarse x_coarse(decoded_q,coarse);
 edge_actu_softmax_sub_align_fine x_fine(coarse_q,aligned);
 edge_actu_softmax_sub_add x_add(aligned_q,sum_packet);
 edge_actu_softmax_sub_normalize x_normalize(sum_packet,normalized_packet);
-edge_actu_softmax_sub_round x_round(normalized_q,packed_value);
+edge_actu_softmax_sub_round x_round(normalized_q,packed_value,overflow_before_capture,candidate_before_capture);
 assign delta_before_capture=packed_value;
 always @(posedge clk) begin
   decoded_q<=decoded; coarse_q<=coarse; aligned_q<=aligned; normalized_q<=normalized_packet;
@@ -50,11 +57,11 @@ always @(posedge clk or negedge cpurst_b)
 assign out_valid=valid_q[4];
 endmodule
 
-// Packet: bypass, BF16 bypass value, sign, exponent, same sign, two
+// Numeric packet: sign, exponent, same sign, two
 // 11-bit significands (8 main + GRS), alignment distance.
 module edge_actu_softmax_sub_decode (
   input wire [15:0] value_bf16, max_bf16,
-  output wire [56:0] packet
+  output wire [39:0] packet
 );
 wire [15:0] a=value_bf16;
 wire [15:0] b={~max_bf16[15],max_bf16[14:0]};
@@ -72,26 +79,23 @@ wire [10:0] large_sig=b_larger?b_sig:a_sig;
 wire [10:0] small_sig=b_larger?a_sig:b_sig;
 wire sign_z=b_larger?b[15]:a[15];
 wire same_sign=a[15]==b[15];
-wire bypass=(a[14:0]==0)||(b[14:0]==0)||
-            (a[14:7]==8'hff)||(b[14:7]==8'hff);
-wire [15:0] bypass_value=a[14:0]==0?b:b[14:0]==0?a:16'h7fc0;
-assign packet={bypass,bypass_value,sign_z,large_exp,same_sign,large_sig,small_sig,shift};
+assign packet={sign_z,large_exp,same_sign,large_sig,small_sig,shift};
 endmodule
 
 // Combinational wrapper retained for the arithmetic oracle boundary.
 module edge_actu_softmax_sub_align (
-  input wire [56:0] packet,
-  output wire [48:0] aligned_packet
+  input wire [39:0] packet,
+  output wire [31:0] aligned_packet
 );
-wire [50:0] coarse;
+wire [33:0] coarse;
 edge_actu_softmax_sub_align_coarse x_coarse(packet,coarse);
 edge_actu_softmax_sub_align_fine x_fine(coarse,aligned_packet);
 endmodule
 
 // Jam discarded bits into bit zero at each step. Jammed right shifts compose.
 module edge_actu_softmax_sub_align_coarse (
-  input wire [56:0] packet,
-  output wire [50:0] coarse_packet
+  input wire [39:0] packet,
+  output wire [33:0] coarse_packet
 );
 wire [7:0] shift=packet[7:0];
 wire [10:0] small_sig=packet[18:8];
@@ -104,12 +108,12 @@ always @* begin
     default: shifted=small_sig;
   endcase
 end
-assign coarse_packet={packet[56:19],shifted,shift[1:0]};
+assign coarse_packet={packet[39:19],shifted,shift[1:0]};
 endmodule
 
 module edge_actu_softmax_sub_align_fine (
-  input wire [50:0] packet,
-  output wire [48:0] aligned_packet
+  input wire [33:0] packet,
+  output wire [31:0] aligned_packet
 );
 wire [10:0] small_sig=packet[12:2];
 reg [10:0] shifted;
@@ -121,33 +125,31 @@ always @* begin
     default: shifted=small_sig;
   endcase
 end
-assign aligned_packet={packet[50:13],shifted};
+assign aligned_packet={packet[33:13],shifted};
 endmodule
 
 module edge_actu_softmax_sub_add (
-  input wire [48:0] packet,
-  output wire [37:0] sum_packet
+  input wire [31:0] packet,
+  output wire [20:0] sum_packet
 );
-wire bypass,sign_z,same_sign;
-wire [15:0] bypass_value;
+wire sign_z,same_sign;
 wire [7:0] exponent;
 wire [10:0] large_sig,aligned_small;
-assign {bypass,bypass_value,sign_z,exponent,same_sign,large_sig,aligned_small}=packet;
+assign {sign_z,exponent,same_sign,large_sig,aligned_small}=packet;
 wire [10:0] addend=aligned_small^{11{!same_sign}};
 wire [11:0] raw_sum={1'b0,large_sig}+{1'b0,addend}+{11'b0,!same_sign};
 wire [11:0] sum={raw_sum[11]&&same_sign,raw_sum[10:0]};
-assign sum_packet={bypass,bypass_value,sign_z,exponent,sum};
+assign sum_packet={sign_z,exponent,sum};
 endmodule
 
 module edge_actu_softmax_sub_pack (
-  input wire [37:0] packet,
+  input wire [20:0] packet,
   output reg [15:0] delta_bf16
 );
-wire bypass,sign_z;
-wire [15:0] bypass_value;
+wire sign_z;
 wire [7:0] large_exp;
 wire [11:0] sum;
-assign {bypass,bypass_value,sign_z,large_exp,sum}=packet;
+assign {sign_z,large_exp,sum}=packet;
 reg [10:0] normalized,probe;
 reg [3:0] count;
 reg [8:0] exponent,rounded;
@@ -169,24 +171,22 @@ always @* begin
   rounded={1'b0,normalized[10:3]}+{8'b0,increment};
   if(rounded[8])begin rounded=rounded>>1;exponent=exponent+9'd1;end
   if(!rounded[7])exponent=0;
-  if(bypass)delta_bf16=bypass_value;
-  else if(sum==0)delta_bf16=0;
+  if(sum==0)delta_bf16=0;
   else if(exponent>=255)delta_bf16={sign_z,8'hff,7'b0};
   else delta_bf16={sign_z,exponent[7:0],rounded[6:0]};
 end
 endmodule
 
 // G3: addition is followed by normalization; no rounding yet.
-// Packet: bypass, bypass value, sign, zero, exponent, normalized 8+GRS.
+// Packet: sign, zero, exponent, normalized 8+GRS.
 module edge_actu_softmax_sub_normalize (
- input wire [37:0] packet,
- output wire [38:0] normalized_packet
+ input wire [20:0] packet,
+ output wire [21:0] normalized_packet
 );
-wire bypass,sign_z;
-wire [15:0] bypass_value;
+wire sign_z;
 wire [7:0] large_exp;
 wire [11:0] sum;
-assign {bypass,bypass_value,sign_z,large_exp,sum}=packet;
+assign {sign_z,large_exp,sum}=packet;
 reg [10:0] normalized,probe;
 reg [3:0] count;
 reg [8:0] exponent;
@@ -204,19 +204,23 @@ always @* begin
  end else normalized=probe;
  exponent=exponent-{5'b0,count};
 end
-assign normalized_packet={bypass,bypass_value,sign_z,(sum==0),exponent,normalized};
+assign normalized_packet={sign_z,(sum==0),exponent,normalized};
 endmodule
 
 // G4: preserve the original single BF16 RNE, including exponent carry.
 module edge_actu_softmax_sub_round (
- input wire [38:0] packet,
- output reg [15:0] delta_bf16
+ input wire [21:0] packet,
+ output reg [15:0] delta_bf16,
+ output wire overflow,
+ output wire [15:0] candidate_bf16
 );
-wire bypass,sign_z,zero;
-wire [15:0] bypass_value;
+wire sign_z,zero;
+assign overflow=!zero && exponent>=255;
+// Candidate is unconditional. Only raw compatibility outputs materialize Inf/zero.
+assign candidate_bf16={sign_z,exponent[7:0],rounded[6:0]};
 wire [8:0] normalized_exp;
 wire [10:0] normalized;
-assign {bypass,bypass_value,sign_z,zero,normalized_exp,normalized}=packet;
+assign {sign_z,zero,normalized_exp,normalized}=packet;
 reg [8:0] exponent,rounded;
 reg increment;
 always @* begin
@@ -225,8 +229,7 @@ always @* begin
  rounded={1'b0,normalized[10:3]}+{8'b0,increment};
  if(rounded[8])begin rounded=rounded>>1;exponent=exponent+9'd1;end
  if(!rounded[7])exponent=0;
- if(bypass)delta_bf16=bypass_value;
- else if(zero)delta_bf16=0;
+ if(zero)delta_bf16=0;
  else if(exponent>=255)delta_bf16={sign_z,8'hff,7'b0};
  else delta_bf16={sign_z,exponent[7:0],rounded[6:0]};
 end

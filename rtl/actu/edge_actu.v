@@ -35,7 +35,7 @@ localparam integer INGRESS_LATENCY = 7;
 localparam integer NONLINEAR_LATENCY = 7;
 localparam integer TRANSPORT_LATENCY = 6;
 localparam integer BACKEND_EGRESS_LATENCY = 1;
-localparam integer SEMANTIC_TRANSPORT_STAGES = INGRESS_LATENCY + 4 + 1 + NONLINEAR_LATENCY + 1;
+localparam integer SEMANTIC_TRANSPORT_STAGES = INGRESS_LATENCY + 4;
 localparam integer POST_STAGES = PIPE_STAGES - INGRESS_LATENCY - NONLINEAR_LATENCY -
                                  TRANSPORT_LATENCY -
                                  BACKEND_EGRESS_LATENCY;
@@ -81,10 +81,13 @@ assign softmax_sum_value = INPUT_POLICY && row_nan ? 32'h7fc00000 :
 // Semantic results travel beside, and never select operands inside, arithmetic.
 // Only valid/control resets. A cancelled packet's action is never observable.
 wire [2:0] input_action;
+wire input_zero;
+reg [INGRESS_LATENCY-1:0] input_zero_q;
 reg [2:0] action_q [0:SEMANTIC_TRANSPORT_STAGES-1];
 integer action_stage;
-edge_actu_input_action x_input_action(in_mode,in_value[31:16],in_softmax_max,input_action);
+edge_actu_input_action x_input_action(in_mode,in_value[31:16],in_softmax_max,input_action,input_zero);
 always @(posedge forever_cpuclk) begin
+  input_zero_q<={input_zero_q[INGRESS_LATENCY-2:0],input_zero};
   action_q[0]<=input_action;
   for(action_stage=1;action_stage<SEMANTIC_TRANSPORT_STAGES;action_stage=action_stage+1)
     action_q[action_stage]<=action_q[action_stage-1];
@@ -93,7 +96,18 @@ end
 
 // The reducer samples the backend output after 20 packet captures. Clear wins
 // over a simultaneous element, exactly as in the numerical queue controller.
-wire [2:0] sum_action=action_q[SEMANTIC_TRANSPORT_STAGES-1];
+wire [3:0] front_action;
+reg [3:0] generated_action_q[0:NONLINEAR_LATENCY+1];
+integer generated_stage;
+always @(posedge forever_cpuclk)begin
+ // Both actions describe the frontend output packet. Merge before backend relay.
+ generated_action_q[0]<=action_q[SEMANTIC_TRANSPORT_STAGES-1]!=0 ?
+   {1'b0,action_q[SEMANTIC_TRANSPORT_STAGES-1]} : front_action;
+ for(generated_stage=1;generated_stage<NONLINEAR_LATENCY+2;generated_stage=generated_stage+1)
+  generated_action_q[generated_stage]<=generated_action_q[generated_stage-1];
+end
+wire [3:0] sum_action=generated_action_q[NONLINEAR_LATENCY+1];
+wire [3:0] final_action=sum_action;
 reg row_nan,row_inf;
 always @(posedge forever_cpuclk or negedge cpurst_b) begin
  if(!cpurst_b)begin row_nan<=0;row_inf<=0;end
@@ -105,9 +119,12 @@ always @(posedge forever_cpuclk or negedge cpurst_b) begin
  end
 end
 wire [21:0] sum_numeric;
-// Zero is materialized once at the stateful boundary: unlike a dead numerical
-// candidate, an arbitrary zero candidate must not enter a later row sum.
-wire [21:0] sum_operand=(INPUT_POLICY && sum_action!=0)?22'b0:aligned_primary_bf22;
+// This is the EXP result output into the stateful reducer, not a numerical
+// pipeline input. Merge its semantic result here; INF is retained by row_inf.
+wire sum_numeric_class=(aligned_primary_class==3'd0)||(aligned_primary_class==3'd2);
+wire [21:0] sum_result=aligned_primary_class==3'd3 ? 22'h1fbe1a :
+                       sum_numeric_class ? aligned_primary_bf22 : 22'b0;
+wire [21:0] sum_operand=(INPUT_POLICY && sum_action!=0 && sum_action!=4'd10) ? 22'b0 : sum_result;
 edge_actu_softmax_rsum x_softmax_rsum(
  .clk(forever_cpuclk),.cpurst_b(cpurst_b),.clear_i(backend_sum_clear),
  .in_valid_i(nonlinear_out_valid && aligned_mode==3'd5),.in_last_i(backend_last),
@@ -115,7 +132,7 @@ edge_actu_softmax_rsum x_softmax_rsum(
  .out_done_o(finalizer_sum_done),.out_sum_bf22_o(sum_numeric));
 assign finalizer_sum_value={sum_numeric,10'b0};
 
-wire ingress_valid, ingress_last, ingress_clear, ingress_underflow;
+wire ingress_valid, ingress_last, ingress_clear, ingress_underflow, ingress_overflow, ingress_clamped;
 wire [2:0] ingress_mode;
 wire [15:0] ingress_value;
 wire [21:0] ingress_scalar;
@@ -128,20 +145,21 @@ edge_actu_exp_ingress x_exp_ingress (
   .in_value_bf16(in_value[31:16]),.in_scalar_bits(in_softmax_max),
   .out_valid(ingress_valid),.out_last(ingress_last),.out_sum_clear(ingress_clear),
   .out_mode(ingress_mode),.out_value_bf16(ingress_value),.out_scalar_bf22(ingress_scalar),
-  .out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(),.out_hi(ingress_hi),.out_residual(),
+  .out_clamped(ingress_clamped),.out_overflow(ingress_overflow),.out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(),.out_hi(ingress_hi),.out_residual(),
   .out_residual_product(ingress_residual_product)
 );
 
-edge_actu_exp_frontend #(.FINITE_INPUTS(INPUT_POLICY)) x_exp_frontend (
+edge_actu_exp_frontend #(.FINITE_INPUTS(INPUT_POLICY),.RANGE_STATUS(1),.OUTPUT_POLICY(INPUT_POLICY),.PRECLASSIFIED_INPUT(INPUT_POLICY)) x_exp_frontend (
   .clk(forever_cpuclk),
   .cpurst_b(cpurst_b),
   .in_valid(ingress_valid),
   .in_last(ingress_last),
   .in_mode(ingress_mode),
   .in_value_bf16(ingress_value),
+  .in_value_zero(input_zero_q[INGRESS_LATENCY-1]),
   .in_scalar_bf22(ingress_scalar),
   .in_sum_clear(ingress_clear),
-  .exp_underflow(ingress_underflow),.exp2_k(ingress_k),.exp_hi(ingress_hi),.exp_residual_product(ingress_residual_product),
+  .out_result_action(front_action),.exp_clamped(ingress_clamped),.exp_overflow(ingress_overflow),.exp_underflow(ingress_underflow),.exp2_k(ingress_k),.exp_hi(ingress_hi),.exp_residual_product(ingress_residual_product),
   .out_valid(front_valid),
   .out_last(front_last),
   .out_mode(front_mode),
@@ -190,7 +208,7 @@ edge_actu_finalizer_classified #(.INPUT_POLICY(INPUT_POLICY),.FINITE_INPUTS(INPU
   .in_payload_class(aligned_payload_class),
   .in_rcp_class(aligned_rcp_class),
   .in_primary_operand(primary_operand),.in_payload_operand(payload_operand),.in_rcp_operand(rcp_operand),
-  .in_result_action(action_q[SEMANTIC_TRANSPORT_STAGES-1]),
+  .in_result_action(final_action),
   .in_sum_clear(backend_sum_clear),
   .out_valid(finalizer_out_valid),
   .out_mode(finalizer_out_mode),
@@ -205,7 +223,8 @@ endmodule
 // Function semantics, deliberately separate from BF add/multiply/rounding.
 module edge_actu_input_action(
  input wire [2:0] mode,input wire [15:0] x,input wire [31:0] scalar,
- output reg [2:0] action);
+ output reg [2:0] action, output wire x_zero);
+assign x_zero=(x[14:0]==0);
 wire [21:0] s=mode==7 ? scalar[31:10] : {scalar[31:16],6'b0};
 wire xn=(&x[14:7]) && (|x[6:0]);
 wire xi=(&x[14:7]) && !(|x[6:0]);
@@ -217,7 +236,7 @@ always @* begin
  if(xn || (scalar_used && sn)) action=7;
  else case(mode)
   0:if(xi)action=x[15]?3'd1:3'd5;
-  1:if(xi || x[14:0]==0)action=1;
+  1:if(xi || x_zero)action=1;
   2:if(xi)action=x[15]?3'd1:3'd3;
   3:if(xi)action=x[15]?3'd2:3'd5;
   4:if(xi)action=x[15]?3'd4:3'd3;
@@ -229,7 +248,7 @@ always @* begin
   6:begin
    if(x[15])action=1;
    else if(si && s[21])action=7;
-   else if(xi || si || (x[14:0]==0 && s[20:0]==0))action=1;
+   else if(xi || si || (x_zero && s[20:0]==0))action=1;
   end
   7:begin
    if(xi && si)action=7;
