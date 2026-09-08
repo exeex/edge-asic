@@ -3,7 +3,7 @@
 // West-side ACTU frontend. EXP and the fused native-BF22 numerator /
 // denominator transform stay behind a registered physical boundary.
 (* keep_hierarchy = "yes" *)
-module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0, parameter RANGE_STATUS=0, parameter OUTPUT_POLICY=0, parameter PRECLASSIFIED_INPUT=0) (
+module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0, parameter RANGE_STATUS=0, parameter OUTPUT_POLICY=0, parameter PRECLASSIFIED_INPUT=0, parameter PRE_ROUNDED_EXP=0) (
   input  wire        clk,
   input  wire        cpurst_b,
   input  wire        in_valid,
@@ -17,6 +17,7 @@ module edge_actu_exp_frontend #(parameter FINITE_INPUTS=0, parameter RANGE_STATU
   input wire signed [9:0] exp2_k,
   input wire [14:0] exp_hi,
   input wire [20:0] exp_residual_product,
+  input wire [14:0] exp_rounded_mant,
   output reg         out_valid,
   output reg         out_last,
   output reg  [2:0]  out_mode,
@@ -72,8 +73,8 @@ localparam [18:0] BF22_ONE_EXT = {14'h2000, 5'b0};
 wire [28:0] exp_product_q28;
 wire [21:0] exp_packed_bf22;
 wire [18:0] aligned_e_s1;
-wire [19:0] den_raw_s1;
-wire [18:0] tanh_num_raw_s1;
+wire [19:0] den_raw_s2;
+wire [18:0] tanh_num_raw_s2_next;
 wire [4:0] tanh_num_lzc_s2;
 wire [21:0] den_bf22_s2;
 wire [21:0] tanh_num_bf22_s3;
@@ -97,10 +98,13 @@ reg         sum_clear_s1;
 reg [21:0]  exp_s1;
 wire [21:0] value_bf22_s1 = {payload_bf19_s1, 3'b0};
 reg [21:0]  scalar_bf22_s1;
-reg [19:0]  den_raw_s1_q;
-reg [18:0]  tanh_num_raw_s1_q;
+reg [18:0]  aligned_e_s1_q;
 reg [7:0]   bypass_add_exp_s1_q;
-reg [19:0]  bypass_add_raw_s1_q;
+reg [12:0]  bypass_add_lo_s1_q;
+reg [7:0]   bypass_add_hi_s1_q;
+wire [19:0] bypass_add_raw_s2 =
+    {bypass_add_hi_s1_q,bypass_add_lo_s1_q[11:0]} +
+    {7'b0,bypass_add_lo_s1_q[12],12'b0};
 
 reg         valid_s2;
 reg         last_s2;
@@ -122,7 +126,6 @@ reg [13:0]  bypass_small_sig;
 reg [18:0]  bypass_large_ext;
 reg [18:0]  bypass_small_ext;
 reg         bypass_sticky;
-reg [19:0]  bypass_add_raw_s1;
 reg [7:0]   bypass_add_exp_s1;
 integer     bypass_shift;
 
@@ -316,28 +319,33 @@ always @* begin
                        {18'b0, bypass_sticky};
   end
   bypass_add_exp_s1 = bypass_large_exp;
-  bypass_add_raw_s1 = {1'b0, bypass_large_ext} +
-                      {1'b0, bypass_small_ext};
 end
 
 // F0: G6 already captured the lookup and residual multiplication.
 assign exp_product_q28={exp_hi,14'b0}+{8'b0,exp_residual_product};
+generate if(PRE_ROUNDED_EXP)begin: ingress_rounded_exp
+ wire signed [10:0] packed_exp={exp2_k[9],exp2_k}+11'sd127+{10'b0,exp_rounded_mant[14]};
+ assign exp_packed_bf22={1'b0,packed_exp[7:0],exp_rounded_mant[14] ? 13'b0 : exp_rounded_mant[12:0]};
+ assign exp_packed_class=(exp2_k < -10'sd126) ? 3'd1 :
+                        (exp2_k > 10'sd127 || packed_exp >= 11'sd255) ? 3'd4 : 3'd0;
+end else begin: local_rounded_exp
 edge_actu_exp2_pack_q28_bf22_classified x_exp_pack (
   .exp2_k(exp2_k), .mant_product_q28(exp_product_q28),
   .candidate_bf22(exp_packed_bf22),.value_class(exp_packed_class)
 );
+end endgenerate
 // Consume EXP status at the narrow alignment boundary; candidate runs freely.
 // OUTPUT_POLICY removes all status control from numerical alignment.
 assign aligned_e_s1 = OUTPUT_POLICY ? align_to_one_grs(exp_s0) :
                       exp_class_s0==3'd1 ? 19'b0 :
                       exp_class_s0==3'd4 ? BF22_ONE_EXT : align_to_one_grs(exp_s0);
-assign den_raw_s1 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1};
+assign den_raw_s2 = {1'b0, BF22_ONE_EXT} + {1'b0, aligned_e_s1_q};
 // align_to_one_grs is proven <= ONE_EXT for all BF22 encodings.
-assign tanh_num_raw_s1 = BF22_ONE_EXT - aligned_e_s1;
-assign tanh_num_lzc_s2 = lzc19(tanh_num_raw_s1_q);
-assign den_bf22_s2 = pack_den_bf22(den_raw_s1_q);
+assign tanh_num_raw_s2_next = BF22_ONE_EXT - aligned_e_s1_q;
+assign tanh_num_lzc_s2 = lzc19(tanh_num_raw_s2_next);
+assign den_bf22_s2 = pack_den_bf22(den_raw_s2);
 assign add_packet_s2 = pack_positive_add_classified(
-                              bypass_add_raw_s1_q,
+                              bypass_add_raw_s2,
                               bypass_add_exp_s1_q);
 assign tanh_num_bf22_s3 = pack_num_bf22(tanh_num_raw_s2,
                                         tanh_num_lzc_s2_q);
@@ -384,18 +392,19 @@ always @(posedge clk) begin
 
     scalar_bf22_s0 <= in_scalar_bf22;
 
-    // F1: shared alignment and parallel 1+e / 1-e raw arithmetic.
+    // F1: capture aligned e and parallel low/high x+epsilon sums.
     mode_s1 <= mode_s0;
     payload_bf19_s1 <= payload_bf19_s0;
     exp_s1 <= exp_s0;
 
     scalar_bf22_s1 <= scalar_bf22_s0;
-    den_raw_s1_q <= den_raw_s1;
-    tanh_num_raw_s1_q <= tanh_num_raw_s1;
+    aligned_e_s1_q <= aligned_e_s1;
     bypass_add_exp_s1_q <= bypass_add_exp_s1;
-    bypass_add_raw_s1_q <= bypass_add_raw_s1;
+    bypass_add_lo_s1_q <= {1'b0,bypass_large_ext[11:0]} + {1'b0,bypass_small_ext[11:0]};
+    bypass_add_hi_s1_q <= {1'b0,bypass_large_ext[18:12]} + {1'b0,bypass_small_ext[18:12]};
 
-    // F2: denominator pack and numerator leading-zero detection.
+    // F2: form 1+e / 1-e, pack denominator and count numerator zeros;
+    // merge x+epsilon carry before its numerical pack and generated class.
     mode_s2 <= mode_s1;
     payload_bf19_s2 <= payload_bf19_s1;
     exp_s2 <= exp_s1;
@@ -403,7 +412,7 @@ always @(posedge clk) begin
     scalar_bf22_s2 <= scalar_bf22_s1;
     den_s2 <= den_bf22_s2;
     bypass_add_s2 <= bypass_add_bf22_s2;
-    tanh_num_raw_s2 <= tanh_num_raw_s1_q;
+    tanh_num_raw_s2 <= tanh_num_raw_s2_next;
     tanh_num_lzc_s2_q <= tanh_num_lzc_s2;
 
     // F3: numerator normalize/pack and native-BF22 frontend packet.

@@ -137,19 +137,18 @@ wire [2:0] ingress_mode;
 wire [15:0] ingress_value;
 wire [21:0] ingress_scalar;
 wire signed [9:0] ingress_k;
-wire [14:0] ingress_hi;
-wire [20:0] ingress_residual_product;
-edge_actu_exp_ingress x_exp_ingress (
+wire [14:0] ingress_rounded_mant;
+edge_actu_exp_ingress #(.PRE_ROUNDED_EXP(1)) x_exp_ingress (
   .clk(forever_cpuclk),.cpurst_b(cpurst_b),.in_valid(input_fire),
   .in_last(in_last),.in_sum_clear(softmax_sum_clear),.in_mode(in_mode),
   .in_value_bf16(in_value[31:16]),.in_scalar_bits(in_softmax_max),
   .out_valid(ingress_valid),.out_last(ingress_last),.out_sum_clear(ingress_clear),
   .out_mode(ingress_mode),.out_value_bf16(ingress_value),.out_scalar_bf22(ingress_scalar),
-  .out_clamped(ingress_clamped),.out_overflow(ingress_overflow),.out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(),.out_hi(ingress_hi),.out_residual(),
-  .out_residual_product(ingress_residual_product)
+  .out_clamped(ingress_clamped),.out_overflow(ingress_overflow),.out_underflow(ingress_underflow),.out_exp2_k(ingress_k),.out_frac_code(),.out_hi(),.out_residual(),
+  .out_residual_product(),.out_rounded_mant(ingress_rounded_mant)
 );
 
-edge_actu_exp_frontend #(.FINITE_INPUTS(INPUT_POLICY),.RANGE_STATUS(1),.OUTPUT_POLICY(INPUT_POLICY),.PRECLASSIFIED_INPUT(INPUT_POLICY)) x_exp_frontend (
+edge_actu_exp_frontend #(.FINITE_INPUTS(INPUT_POLICY),.RANGE_STATUS(1),.OUTPUT_POLICY(INPUT_POLICY),.PRECLASSIFIED_INPUT(INPUT_POLICY),.PRE_ROUNDED_EXP(1)) x_exp_frontend (
   .clk(forever_cpuclk),
   .cpurst_b(cpurst_b),
   .in_valid(ingress_valid),
@@ -159,7 +158,7 @@ edge_actu_exp_frontend #(.FINITE_INPUTS(INPUT_POLICY),.RANGE_STATUS(1),.OUTPUT_P
   .in_value_zero(input_zero_q[INGRESS_LATENCY-1]),
   .in_scalar_bf22(ingress_scalar),
   .in_sum_clear(ingress_clear),
-  .out_result_action(front_action),.exp_clamped(ingress_clamped),.exp_overflow(ingress_overflow),.exp_underflow(ingress_underflow),.exp2_k(ingress_k),.exp_hi(ingress_hi),.exp_residual_product(ingress_residual_product),
+  .out_result_action(front_action),.exp_clamped(ingress_clamped),.exp_overflow(ingress_overflow),.exp_underflow(ingress_underflow),.exp2_k(ingress_k),.exp_hi(15'b0),.exp_residual_product(21'b0),.exp_rounded_mant(ingress_rounded_mant),
   .out_valid(front_valid),
   .out_last(front_last),
   .out_mode(front_mode),

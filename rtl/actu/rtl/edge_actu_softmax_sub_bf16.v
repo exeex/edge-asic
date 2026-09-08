@@ -19,7 +19,7 @@ assign delta_bf16=value_bf16[14:0]==0 ? {~max_bf16[15],max_bf16[14:0]} :
                   (&value_bf16[14:7]) || (&max_bf16[14:7]) ? 16'h7fc0 : numeric_delta;
 endmodule
 
-// Five captures: decode, coarse/fine alignment, add+normalize, RNE.
+// Four captures: decode+coarse, fine+add, normalize, RNE.
 module edge_actu_softmax_sub_bf16_pipe (
   input wire clk, cpurst_b, in_valid,
   input wire [15:0] value_bf16, max_bf16,
@@ -35,26 +35,27 @@ wire [20:0] sum_packet;
 wire [15:0] packed_value;
 wire [33:0] coarse;
 reg [33:0] coarse_q;
-reg [39:0] decoded_q;
-reg [31:0] aligned_q;
+
+// G1 stores sign + exponent + the exact 12-bit sum; no rounding here.
+reg [20:0] sum_q;
 wire [21:0] normalized_packet;
 reg [21:0] normalized_q;
-reg [4:0] valid_q;
+reg [3:0] valid_q;
 edge_actu_softmax_sub_decode x_decode(value_bf16,max_bf16,decoded);
-edge_actu_softmax_sub_align_coarse x_coarse(decoded_q,coarse);
+edge_actu_softmax_sub_align_coarse x_coarse(decoded,coarse);
 edge_actu_softmax_sub_align_fine x_fine(coarse_q,aligned);
-edge_actu_softmax_sub_add x_add(aligned_q,sum_packet);
-edge_actu_softmax_sub_normalize x_normalize(sum_packet,normalized_packet);
+edge_actu_softmax_sub_add x_add(aligned,sum_packet);
+edge_actu_softmax_sub_normalize x_normalize(sum_q,normalized_packet);
 edge_actu_softmax_sub_round x_round(normalized_q,packed_value,overflow_before_capture,candidate_before_capture);
 assign delta_before_capture=packed_value;
 always @(posedge clk) begin
-  decoded_q<=decoded; coarse_q<=coarse; aligned_q<=aligned; normalized_q<=normalized_packet;
+  coarse_q<=coarse; sum_q<=sum_packet; normalized_q<=normalized_packet;
   delta_bf16<=packed_value;
 end
 always @(posedge clk or negedge cpurst_b)
   if (!cpurst_b) valid_q<=0;
-  else valid_q<={valid_q[3:0],in_valid};
-assign out_valid=valid_q[4];
+  else valid_q<={valid_q[2:0],in_valid};
+assign out_valid=valid_q[3];
 endmodule
 
 // Numeric packet: sign, exponent, same sign, two
@@ -177,7 +178,7 @@ always @* begin
 end
 endmodule
 
-// G3: addition is followed by normalization; no rounding yet.
+// Normalize the exact sum; G2 in the retimed ingress, with no rounding yet.
 // Packet: sign, zero, exponent, normalized 8+GRS.
 module edge_actu_softmax_sub_normalize (
  input wire [20:0] packet,
@@ -207,7 +208,7 @@ end
 assign normalized_packet={sign_z,(sum==0),exponent,normalized};
 endmodule
 
-// G4: preserve the original single BF16 RNE, including exponent carry.
+// G3 in the retimed ingress: single BF16 RNE, including exponent carry.
 module edge_actu_softmax_sub_round (
  input wire [21:0] packet,
  output reg [15:0] delta_bf16,
