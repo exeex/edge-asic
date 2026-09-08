@@ -188,7 +188,8 @@ endmodule
 // First half of the local alignment shifter.  The central exp-max cluster has
 // already converted both exponents into shift_amount_i.
 module edge_dot_align_lane_coarse #(
-  parameter ALIGN_GUARD_BITS = 0
+  parameter ALIGN_GUARD_BITS = 0,
+  parameter ENCODED_SHIFT = 0
 )(
   input  [15:0] product_i,
   input  signed [10:0] shift_amount_i,
@@ -202,7 +203,8 @@ reg [17:0] expanded_product;
 always @* begin
   expanded_product = {2'b0, product_i} << ALIGN_GUARD_BITS;
   fine_o = shift_amount_i[2:0];
-  force_zero_o = (shift_amount_i >= (17 + ALIGN_GUARD_BITS));
+  force_zero_o = ENCODED_SHIFT ? shift_amount_i[5]
+    : (shift_amount_i >= (17 + ALIGN_GUARD_BITS));
   case (shift_amount_i[4:3])
     2'd0: begin
       coarse_o = expanded_product;
@@ -374,7 +376,9 @@ reg [15:0]  s2_prod [0:LANES-1];
 reg         s2_sign [0:LANES-1];
 reg signed [9:0] s2_exp [0:LANES-1];
 reg signed [9:0] s2_max_exp;
-reg signed [10:0] s2_shift [0:LANES-1];
+// Exact coarse-consumer encoding: {force_zero, original_shift[4:0]}.
+// Preserve low bits even for negative shifts on ineligible lanes.
+reg [5:0] s2_shift [0:LANES-1];
 wire [LANES*11-1:0] parallel_shift;
 wire [15:0] parallel_product [0:LANES-1];
 wire parallel_sign [0:LANES-1];
@@ -385,7 +389,7 @@ reg         s3_coarse_sticky [0:LANES-1];
 reg         s3_force_zero [0:LANES-1];
 reg         s3_sign [0:LANES-1];
 reg signed [9:0] s3_max_exp;
-reg signed [20:0] s4_lane [0:LANES-1];
+reg signed [18:0] s4_lane [0:LANES-1];
 reg signed [9:0] s4_max_exp;
 reg signed [SUM_WIDTH-1:0] s5_sum;
 reg signed [9:0] s5_max_exp;
@@ -452,7 +456,7 @@ genvar lane_idx;
 generate
   for (lane_idx = 0; lane_idx < LANES; lane_idx = lane_idx + 1) begin : gen_lane_ext
     assign s4_lane_ext[lane_idx] =
-      {{(SUM_WIDTH-21){s4_lane[lane_idx][20]}}, s4_lane[lane_idx]};
+      {{(SUM_WIDTH-19){s4_lane[lane_idx][18]}}, s4_lane[lane_idx]};
 
     assign s1_product_exp_vec[lane_idx*10 +: 10] = s1_exp[lane_idx];
     assign s1_product_valid_vec[lane_idx] = s1_exp_valid[lane_idx];
@@ -528,10 +532,10 @@ generate
       assign parallel_sign[lane_idx] = 1'b0;
     end
     assign shift_amount_comb[lane_idx] = PARALLEL_MAX_SHIFT
-      ? s2_shift[lane_idx]
+      ? $signed({5'b0,s2_shift[lane_idx]})
       : ($signed(s2_max_exp) - $signed(s2_exp[lane_idx]));
     edge_dot_align_lane_coarse #(
-      .ALIGN_GUARD_BITS(ALIGN_GUARD_BITS)
+      .ALIGN_GUARD_BITS(ALIGN_GUARD_BITS), .ENCODED_SHIFT(PARALLEL_MAX_SHIFT)
     ) x_align_lane (
       .product_i(s2_prod[lane_idx]),
       .shift_amount_i(shift_amount_comb[lane_idx]),
@@ -582,20 +586,20 @@ endgenerate
 
 generate
   if (SPLIT_REDUCTION && LANES == 16) begin : gen_split_add16
-    reg signed [22:0] s5a_group [0:3];
+    reg signed [20:0] s5a_group [0:3];
     reg signed [9:0] s5a_exp;
     reg s5a_valid;
     reg s5a_rsum_enable, s5a_rsum_first, s5a_rsum_last;
     for (genvar group_idx = 0; group_idx < 4; group_idx = group_idx + 1) begin : gen_group
-      wire signed [21:0] pair01 =
-        {s4_lane[group_idx*4][20], s4_lane[group_idx*4]} +
-        {s4_lane[group_idx*4+1][20], s4_lane[group_idx*4+1]};
-      wire signed [21:0] pair23 =
-        {s4_lane[group_idx*4+2][20], s4_lane[group_idx*4+2]} +
-        {s4_lane[group_idx*4+3][20], s4_lane[group_idx*4+3]};
+      wire signed [19:0] pair01 =
+        {s4_lane[group_idx*4][18], s4_lane[group_idx*4]} +
+        {s4_lane[group_idx*4+1][18], s4_lane[group_idx*4+1]};
+      wire signed [19:0] pair23 =
+        {s4_lane[group_idx*4+2][18], s4_lane[group_idx*4+2]} +
+        {s4_lane[group_idx*4+3][18], s4_lane[group_idx*4+3]};
       always @(posedge clk) begin
         if (rst_b) s5a_group[group_idx] <=
-          {pair01[21], pair01} + {pair23[21], pair23};
+          {pair01[19], pair01} + {pair23[19], pair23};
       end
     end
     always @(posedge clk or negedge rst_b) begin
@@ -612,11 +616,11 @@ generate
       end
     end
     always @(posedge clk) if (rst_b) s5a_exp <= s4_max_exp;
-    wire signed [23:0] half01 =
-      {s5a_group[0][22], s5a_group[0]} + {s5a_group[1][22], s5a_group[1]};
-    wire signed [23:0] half23 =
-      {s5a_group[2][22], s5a_group[2]} + {s5a_group[3][22], s5a_group[3]};
-    assign s5_sum_next = $signed({half01[23], half01}) + $signed({half23[23], half23});
+    wire signed [21:0] half01 =
+      {s5a_group[0][20], s5a_group[0]} + {s5a_group[1][20], s5a_group[1]};
+    wire signed [21:0] half23 =
+      {s5a_group[2][20], s5a_group[2]} + {s5a_group[3][20], s5a_group[3]};
+    assign s5_sum_next = $signed({half01[21], half01}) + $signed({half23[21], half23});
     assign reduction_valid = s5a_valid;
     assign reduction_exp = s5a_exp;
     assign reduction_rsum_enable = s5a_rsum_enable;
@@ -1167,7 +1171,8 @@ always @(posedge clk or negedge rst_b) begin
     for (i = 0; i < LANES; i = i + 1) begin
       s2_prod[i] <= PARALLEL_MAX_SHIFT ? parallel_product[i] : s1_prod[i];
       s2_sign[i] <= PARALLEL_MAX_SHIFT ? parallel_sign[i] : s1_sign[i];
-      s2_shift[i] <= parallel_shift[i*11+:11];
+      s2_shift[i] <= {($signed(parallel_shift[i*11+:11]) >= (17 + ALIGN_GUARD_BITS)),
+                      parallel_shift[i*11+:5]};
       s2_exp[i] <= s1_exp[i];
     end
 
@@ -1183,7 +1188,7 @@ always @(posedge clk or negedge rst_b) begin
 
     s4_max_exp <= s3_max_exp;
     for (i = 0; i < LANES; i = i + 1) begin
-      s4_lane[i] <= aligned_comb[i];
+      s4_lane[i] <= aligned_comb[i][18:0];
     end
 
     s5_max_exp <= reduction_exp;
