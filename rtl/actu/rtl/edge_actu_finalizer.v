@@ -90,8 +90,8 @@ reg [POST_STAGES-1:0] valid_pipe;
 reg [2:0]             mode_pipe [0:POST_STAGES-1];
 reg [31:0]            value_pipe [0:OUTPUT_PIPE_LAST];
 
-// P0: pure backend/finalizer boundary relay.  No arithmetic is allowed on
-// this edge; M1 consumes only these registered fields.
+// P0: select and capture the prepared M1 operand; relay other packet fields.
+// M1 consumes only these registered fields; capture count and II are unchanged.
 reg               relay_valid_q;
 reg [2:0]         relay_mode_q;
 reg [18:0]        relay_payload_bf19_q;
@@ -250,14 +250,15 @@ function [21:0] prepare_operand;
 endfunction
 reg [21:0] relay_primary_operand,relay_payload_operand,relay_rcp_operand;
 reg [21:0] partial_payload_operand,mul1_payload_operand,mul2_payload_operand;
-wire [21:0] lhs1_operand=(relay_mode_q==EDGE_ACTU_MODE_SOFTMAX_NORMALIZE)?
-                       relay_payload_operand:relay_primary_operand;
+wire [21:0] lhs1_operand=relay_primary_operand;
 wire [23:0] rounded1=round_product(mul1_exp_q,mul1_product_q);
 wire [23:0] rounded3=round_product(mul3_exp_q,mul3_product_q);
 wire semantic_sign1=(!mul1_zero_q && mul1_special_q)?1'b0:mul1_sign_q;
 wire semantic_sign3=(!mul3_zero_q && mul3_special_q)?1'b0:mul3_sign_q;
 always @(posedge clk)begin
- relay_primary_operand<=PREPARED_INPUTS?in_primary_operand:prepare_operand(in_primary_bf22);
+ relay_primary_operand <= (in_mode==EDGE_ACTU_MODE_SOFTMAX_NORMALIZE) ?
+   (PREPARED_INPUTS?in_payload_operand:prepare_operand({in_payload_bf19,3'b0})) :
+   (PREPARED_INPUTS?in_primary_operand:prepare_operand(in_primary_bf22));
  relay_payload_operand<=PREPARED_INPUTS?in_payload_operand:prepare_operand({in_payload_bf19,3'b0});
  relay_rcp_operand<=PREPARED_INPUTS?in_rcp_operand:prepare_operand(in_rcp_bf22);
  partial_payload_operand<=relay_payload_operand;
@@ -409,7 +410,7 @@ always @(posedge clk) begin
     for (data_stage = 1; data_stage < POST_STAGES; data_stage = data_stage + 1)
       mode_pipe[data_stage] <= mode_pipe[data_stage - 1];
 
-    // P0: pure packet relay at the backend/finalizer boundary.
+    // P0: packet relay; prepared M1 operand is selected in its capture block above.
     relay_payload_bf19_q <= in_payload_bf19;
     relay_primary_bf22_q <= in_primary_bf22;
     relay_rcp_bf22_q <= in_rcp_bf22;
