@@ -101,7 +101,8 @@ edge_actu_rcp_rsqrt_seed_q16 x_seed (
   .seed_q16(seed_q16)
 );
 
-// S1/S2: register two 14x7 partial products, then add and round once to Q16.
+// S1/S2: compress product bits plus rounding into high sum/carry and one
+// low-column carry; capture them, then resolve the final Q16 sum at S2.
 edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_common (
   .clk(clk),
   .cpurst_b(cpurst_b),
@@ -111,7 +112,7 @@ edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_common (
 );
 
 // S3/S4: RSQRT forms m*y0*y0. RCP captures its correction at S3,
-// then starts its result partial products at S4 instead of relaying a wide
+// then starts its result compression at S4 instead of relaying a wide
 // completed result. This separates correction carry propagation from multiply.
 assign rcp_corr_q16 = 18'h20000 - common_mul_s2;
 edge_actu_mul14_round9_q16 #(.RESET_DATA(0)) x_mul_rsqrt_t1 (
@@ -130,7 +131,8 @@ edge_actu_mul14_round10_q16 #(.RESET_DATA(0)) x_mul_rcp_result (
 );
 
 // Fold RSQRT correction into the S4 sum/round capture; S5 now contains
-// only the result partial products. RCP captures its rounded result at S5,
+// only result compression and the discarded low-column carry. RCP captures
+// its rounded result at S5,
 // and both modes still meet at S6 with unchanged seven-capture latency.
 assign rsqrt_half_q16 = rsqrt_t1_q16 >> 1;
 assign rsqrt_corr_q16 = 18'h18000 - rsqrt_half_q16;
