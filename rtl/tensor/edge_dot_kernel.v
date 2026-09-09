@@ -285,7 +285,7 @@ endmodule
 //       parallel mantissa multiplies, otherwise it relays products
 //   s3: coarse product alignment by 0/8/16/24 bits
 //   s4: fine product alignment by 0..7 bits, RNE, and sign
-//   s5: signed adder tree; SPLIT_REDUCTION adds s5a (16-to-4) before s5 (4-to-1)
+//   s5: signed dot8 adder tree; dot16 is owned by edge_dot16_kernel.
 //   s6: normalize the row sum; either round directly to BF16 or accumulate
 //       successive row sums in the private BF22 RSUM accumulator
 //   r6: emit one BF16 result when the RSUM sequence marks its last row
@@ -294,16 +294,14 @@ module edge_dot_kernel #(
   parameter PARTIAL_ONLY = 0,
   parameter FPGA_DSP_ADD = 0,
   parameter FPGA_DSP_MUL = 0,
-  parameter LANES = 8,
-  parameter SUM_WIDTH = (LANES == 16) ? 25 : 24,
+  localparam LANES = 8,
+  parameter SUM_WIDTH = 24,
   parameter ALIGN_GUARD_BITS = 0,
   parameter INPUTS_SANITIZED = 0,
   parameter EXTERNAL_WEIGHT_EXP = 0,
   parameter EXTERNAL_PRODUCTS = 0,
   // External leaf captures operands at s0; its combinational product enters s1.
   parameter EXTERNAL_PRODUCTS_REGISTERED = 0,
-  // E4 partial-only dot16: insert a full-precision 16-to-4 capture.
-  parameter SPLIT_REDUCTION = 0,
   // Retimed product and precomputed shift meet at s2.
   parameter PARALLEL_MAX_SHIFT = 0
 )(
@@ -585,48 +583,7 @@ generate
 endgenerate
 
 generate
-  if (SPLIT_REDUCTION && LANES == 16) begin : gen_split_add16
-    reg signed [20:0] s5a_group [0:3];
-    reg signed [9:0] s5a_exp;
-    reg s5a_valid;
-    reg s5a_rsum_enable, s5a_rsum_first, s5a_rsum_last;
-    for (genvar group_idx = 0; group_idx < 4; group_idx = group_idx + 1) begin : gen_group
-      wire signed [19:0] pair01 =
-        {s4_lane[group_idx*4][18], s4_lane[group_idx*4]} +
-        {s4_lane[group_idx*4+1][18], s4_lane[group_idx*4+1]};
-      wire signed [19:0] pair23 =
-        {s4_lane[group_idx*4+2][18], s4_lane[group_idx*4+2]} +
-        {s4_lane[group_idx*4+3][18], s4_lane[group_idx*4+3]};
-      always @(posedge clk) begin
-        s5a_group[group_idx] <=
-          {pair01[19], pair01} + {pair23[19], pair23};
-      end
-    end
-    always @(posedge clk or negedge rst_b) begin
-      if (!rst_b) begin
-        s5a_valid <= 1'b0;
-        s5a_rsum_enable <= 1'b0;
-        s5a_rsum_first <= 1'b0;
-        s5a_rsum_last <= 1'b0;
-      end else begin
-        s5a_valid <= s4_valid;
-        s5a_rsum_enable <= s4_rsum_enable;
-        s5a_rsum_first <= s4_rsum_first;
-        s5a_rsum_last <= s4_rsum_last;
-      end
-    end
-    always @(posedge clk) s5a_exp <= s4_max_exp;
-    wire signed [21:0] half01 =
-      {s5a_group[0][20], s5a_group[0]} + {s5a_group[1][20], s5a_group[1]};
-    wire signed [21:0] half23 =
-      {s5a_group[2][20], s5a_group[2]} + {s5a_group[3][20], s5a_group[3]};
-    assign s5_sum_next = $signed({half01[21], half01}) + $signed({half23[21], half23});
-    assign reduction_valid = s5a_valid;
-    assign reduction_exp = s5a_exp;
-    assign reduction_rsum_enable = s5a_rsum_enable;
-    assign reduction_rsum_first = s5a_rsum_first;
-    assign reduction_rsum_last = s5a_rsum_last;
-  end else begin : gen_unsplit_add
+  begin : gen_unsplit_add
     assign reduction_valid = s4_valid;
     assign reduction_exp = s4_max_exp;
     assign reduction_rsum_enable = s4_rsum_enable;
@@ -645,20 +602,11 @@ generate
     (* use_dsp = "simd" *) wire signed [23:0] sum4567 = sum45 + sum67;
     (* use_dsp = "simd" *) wire signed [23:0] sum_all = sum0123 + sum4567;
     assign s5_sum_next = sum_all;
-  end else if (LANES == 8) begin : gen_logic_add8
+  end else begin : gen_logic_add8
     assign s5_sum_next = s4_lane_ext[0] + s4_lane_ext[1]
                        + s4_lane_ext[2] + s4_lane_ext[3]
                        + s4_lane_ext[4] + s4_lane_ext[5]
                        + s4_lane_ext[6] + s4_lane_ext[7];
-  end else begin : gen_logic_add16
-    assign s5_sum_next = s4_lane_ext[0] + s4_lane_ext[1]
-                       + s4_lane_ext[2] + s4_lane_ext[3]
-                       + s4_lane_ext[4] + s4_lane_ext[5]
-                       + s4_lane_ext[6] + s4_lane_ext[7]
-                       + s4_lane_ext[8] + s4_lane_ext[9]
-                       + s4_lane_ext[10] + s4_lane_ext[11]
-                       + s4_lane_ext[12] + s4_lane_ext[13]
-                       + s4_lane_ext[14] + s4_lane_ext[15];
   end
   end
 endgenerate
