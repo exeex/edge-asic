@@ -11,7 +11,7 @@ module edge_tile16x16_unit #(
   weight_activate_i,
   input_fifo_write_valid_i,input_fifo_write_ptr_i,input_fifo_write_data_i,
   input_fifo_read_ptr_i,input_fifo_read_data_o,
-  out_valid, output_bf22_o,output_bf16_o
+  out_valid, output_bf20_o
 );
 wire [1:0] group_fill_ready;
 assign weight_fill_ready_o = &group_fill_ready;
@@ -29,8 +29,7 @@ input[1:0]input_fifo_write_ptr_i,input_fifo_read_ptr_i;
 input[255:0]input_fifo_write_data_i;
 output[255:0]input_fifo_read_data_o;
 output out_valid;
-output [351:0] output_bf22_o;
-output [255:0] output_bf16_o;
+output [319:0] output_bf20_o;
 
 wire group0_valid;
 wire group1_valid;
@@ -83,8 +82,7 @@ edge_dot16_group8 #(.LOCAL_WEIGHT_BUFFER(LOCAL_WEIGHT_BUFFER),.TRACK_VALID(0),.R
   .weight_fill_valid_i(weight_fill_valid_i && weight_fill_ready_o),
   .weight_fill_ready_o(group_fill_ready[0]),
   .weight_fill_data_i(weight_fill_data_i[127:0]),.weight_activate_i(weight_activate_i),
-  .out_valid(group0_valid),.output_bf22_o(output_bf22_o[175:0]),
-  .output_bf16_o(output_bf16_o[127:0])
+  .out_valid(group0_valid),.output_bf20_o(output_bf20_o[159:0])
 );
 
 edge_dot16_group8 #(.LOCAL_WEIGHT_BUFFER(LOCAL_WEIGHT_BUFFER),.TRACK_VALID(0),.ROW_BASE(8)) x_slice1_rows (
@@ -98,8 +96,7 @@ edge_dot16_group8 #(.LOCAL_WEIGHT_BUFFER(LOCAL_WEIGHT_BUFFER),.TRACK_VALID(0),.R
   .weight_fill_valid_i(weight_fill_valid_i && weight_fill_ready_o),
   .weight_fill_ready_o(group_fill_ready[1]),
   .weight_fill_data_i(weight_fill_data_i[255:128]),.weight_activate_i(weight_activate_i),
-  .out_valid(group1_valid),.output_bf22_o(output_bf22_o[351:176]),
-  .output_bf16_o(output_bf16_o[255:128])
+  .out_valid(group1_valid),.output_bf20_o(output_bf20_o[319:160])
 );
 
 function [15:0] i8_to_bf16;

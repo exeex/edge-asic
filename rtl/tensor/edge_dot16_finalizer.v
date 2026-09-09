@@ -1,12 +1,11 @@
-// N1/N2: resetless scalar normalization and BF22 packing, followed by BF16 RNE.
+// N1/N2: resetless scalar normalization and BF20 packing (one RNE).
 module edge_dot16_finalizer(
  input clk,
  input signed [22:0] dot16_partial_sum,
  input signed [9:0] dot16_partial_exp,
- output [21:0] bf22_o,
- output [15:0] bf16_o
+ output [19:0] bf20_o
 );
-reg [21:0]  result_bf22_q;
+reg [19:0]  result_bf20_q;
 
 reg         normalize_zero_q;
 reg         normalize_sign_q;
@@ -19,7 +18,7 @@ wire [4:0] dot16_partial_msb = msb_index25(dot16_partial_magnitude);
 wire signed [10:0] dot16_partial_exp_field =
     $signed({dot16_partial_exp[9],dot16_partial_exp})
   + $signed({6'b0,dot16_partial_msb}) - 11'sd7;
-wire [21:0] normalized_result_next = pack_normalized_bf22(
+wire [19:0] normalized_result_next = pack_normalized_bf20(
   normalize_zero_q, normalize_sign_q, {3'b0,normalize_magnitude_q},
   normalize_shift_q, normalize_exp_field_q);
 
@@ -30,11 +29,11 @@ always @(posedge clk) begin
   normalize_magnitude_q <= dot16_partial_magnitude[21:0];
   normalize_shift_q <= encode_pack_shift(dot16_partial_msb, dot16_partial_exp, dot16_partial_exp_field);
   normalize_exp_field_q <= encode_exp_field(dot16_partial_exp_field);
-  result_bf22_q <= normalized_result_next;
+  result_bf20_q <= normalized_result_next;
 end
 
-assign bf22_o=result_bf22_q;
-assign bf16_o=bf16_round_bits(result_bf22_q);
+assign bf20_o=result_bf20_q;
+
 function [4:0] msb_index25;
   input [24:0] value;
   integer idx;
@@ -79,54 +78,44 @@ function signed [5:0] encode_pack_shift;
   reg signed [10:0] sub_right_shift;
   begin
     // exp_field = max_exp + msb - 7. In the subnormal branch,
-    // -max_exp-5 >= msb-12 >= -12, so only the large-right cap is needed.
-    sub_right_shift=-$signed({max_exp[9],max_exp})-11'sd5;
+    // -max_exp-3 >= msb-10 >= -10, so only the large-right cap is needed.
+    sub_right_shift=-$signed({max_exp[9],max_exp})-11'sd3;
     encode_pack_shift=(exp_field <= 11'sd0)
       ? ((sub_right_shift > 11'sd26) ? 6'sd26 : sub_right_shift[5:0])
-      : ($signed({1'b0,msb}) - 6'sd13);
+      : ($signed({1'b0,msb}) - 6'sd11);
   end
 endfunction
 
-function [21:0] pack_normalized_bf22;
+function [19:0] pack_normalized_bf20;
   input zero;
   input sign;
   input [24:0] magnitude;
   input signed [5:0] encoded_shift;
   input [7:0] normalized_exp_field;
   reg [24:0] shifted;
-  reg [14:0] rounded;
+  reg [12:0] rounded;
   integer exp_field,shift;
   begin
     exp_field = normalized_exp_field;
     shift=$signed(encoded_shift);
     if(shift>0)shifted=rshift_rne25(magnitude,shift);
     else shifted=magnitude<<(-shift);
-    if(zero)pack_normalized_bf22=0;
+    if(zero)pack_normalized_bf20=0;
     else begin
-      if(exp_field>=255)pack_normalized_bf22={sign,8'hfe,13'h1fff};
+      if(exp_field>=255)pack_normalized_bf20={sign,8'hfe,11'h7ff};
       else if(exp_field>0)begin
-        rounded=shifted[14:0];
-        if(rounded[14])begin
-          rounded={1'b0,rounded[14:1]};
+        rounded=shifted[12:0];
+        if(rounded[12])begin
+          rounded={1'b0,rounded[12:1]};
           exp_field=exp_field+1;
         end
-        if(exp_field>=255)pack_normalized_bf22={sign,8'hfe,13'h1fff};
-        else pack_normalized_bf22={sign,exp_field[7:0],rounded[12:0]};
+        if(exp_field>=255)pack_normalized_bf20={sign,8'hfe,11'h7ff};
+        else pack_normalized_bf20={sign,exp_field[7:0],rounded[10:0]};
       end else begin
-        if(shifted>=25'd8192)pack_normalized_bf22={sign,8'h01,13'b0};
-        else pack_normalized_bf22={sign,8'h00,shifted[12:0]};
+        if(shifted>=25'd2048)pack_normalized_bf20={sign,8'h01,11'b0};
+        else pack_normalized_bf20={sign,8'h00,shifted[10:0]};
       end
     end
-  end
-endfunction
-
-// N2 emits finite BF22 only, including saturated finite overflow.
-// RNE retains signed zero and may naturally round finite BF22 to BF16 infinity.
-function [15:0] bf16_round_bits;
-  input [21:0] bits;
-  begin
-    bf16_round_bits = bits[21:6]
-      + {15'b0, (bits[5] && (|bits[4:0] || bits[6]))};
   end
 endfunction
 

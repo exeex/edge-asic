@@ -13,7 +13,7 @@ module edge_dot16_kernel #(
   bf16_weight_vec_lo_i, bf16_weight_vec_hi_i,
   weight_fill_valid_i,weight_fill_ready_o,weight_fill_data_i,
   weight_activate_i,
-  out_valid, bf22_o, bf16_o
+  out_valid, bf20_o
 );
 
 input          clk;
@@ -32,8 +32,7 @@ output         weight_fill_ready_o;
 input  [15:0]  weight_fill_data_i;
 input          weight_activate_i;
 output         out_valid;
-output [21:0]  bf22_o;
-output [15:0]  bf16_o;
+output [19:0]  bf20_o;
 
 
 wire signed [22:0] dot16_partial_sum;
@@ -128,7 +127,7 @@ edge_dot16_shifter x_shifter(.clk(clk),.product_i(product),.sign_i(product_sign)
 edge_dot16_adder_tree x_adder_tree(.clk(clk),.aligned_i(aligned),.max_exp_i(aligned_exp),
  .sum_o(dot16_partial_sum),.partial_exp_o(dot16_partial_exp));
 edge_dot16_finalizer x_finalizer(.clk(clk),.dot16_partial_sum(dot16_partial_sum),
- .dot16_partial_exp(dot16_partial_exp),.bf22_o(bf22_o),.bf16_o(bf16_o));
+ .dot16_partial_exp(dot16_partial_exp),.bf20_o(bf20_o));
 
 function [15:0] sanitize_bf16;
   input [15:0] value;

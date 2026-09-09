@@ -9,7 +9,7 @@ module edge_dot16_group8 #(
   int8_weights_i, bf16_weights_i,
   weight_fill_valid_i,weight_fill_ready_o,weight_fill_data_i,
   weight_activate_i,
-  out_valid, output_bf22_o,output_bf16_o
+  out_valid, output_bf20_o
 );
 input clk, rst_b, in_valid, weight_bf16_mode_i;
 input rsum_enable_i,rsum_first_i,rsum_last_i;
@@ -21,8 +21,7 @@ output weight_fill_ready_o;
 input weight_activate_i;
 input[127:0]weight_fill_data_i;
 output out_valid;
-output [175:0] output_bf22_o;
-output [127:0] output_bf16_o;
+output [159:0] output_bf20_o;
 
 wire [7:0] row_valid, row_fill_ready;
 assign weight_fill_ready_o = &row_fill_ready;
@@ -57,8 +56,7 @@ generate
       .weight_fill_data_i(weight_fill_data_i[row*16+:16]),
       .weight_activate_i(weight_activate_i),
       .out_valid(row_valid[row]),
-      .bf22_o(output_bf22_o[row*22 +: 22]),
-      .bf16_o(output_bf16_o[row*16 +: 16])
+      .bf20_o(output_bf20_o[row*20 +: 20])
     );
   end
 endgenerate
