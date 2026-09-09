@@ -19,7 +19,7 @@ wire signed [10:0] dot16_partial_exp_field =
     $signed({dot16_partial_exp[9],dot16_partial_exp})
   + $signed({6'b0,dot16_partial_msb}) - 11'sd7;
 wire [19:0] normalized_result_next = pack_normalized_bf20(
-  normalize_zero_q, normalize_sign_q, {3'b0,normalize_magnitude_q},
+  normalize_zero_q, normalize_sign_q, normalize_magnitude_q,
   normalize_shift_q, normalize_exp_field_q);
 
 // Pure arithmetic captures; the engine (or standalone tracker) owns validity.
@@ -34,30 +34,22 @@ end
 
 assign bf20_o=result_bf20_q;
 
+// Balanced 16/8/4/2 selection instead of a serial priority loop.
 function [4:0] msb_index25;
   input [24:0] value;
-  integer idx;
+  reg [15:0] half;
+  reg [7:0] quarter;
+  reg [3:0] nibble;
+  reg [1:0] pair_bits;
+  reg [4:0] index;
   begin
-    msb_index25=0;
-    for(idx=0;idx<25;idx=idx+1)
-      if(value[idx])msb_index25=idx[4:0];
-  end
-endfunction
-
-function [24:0] rshift_rne25;
-  input [24:0] value;
-  input integer amount;
-  reg [24:0] quotient;
-  reg guard_bit,sticky_bit;
-  begin
-    if(amount<=0)rshift_rne25=value;
-    else if(amount>=26)rshift_rne25=25'b0;
-    else begin
-      quotient=value>>amount;
-      guard_bit=value[amount-1];
-      sticky_bit=(amount<=1)?1'b0:|(value&((25'b1<<(amount-1))-1'b1));
-      rshift_rne25=quotient+(guard_bit&&(sticky_bit||quotient[0]));
-    end
+    index[4]=|value[24:16];
+    half=index[4]?{7'b0,value[24:16]}:value[15:0];
+    index[3]=|half[15:8];quarter=index[3]?half[15:8]:half[7:0];
+    index[2]=|quarter[7:4];nibble=index[2]?quarter[7:4]:quarter[3:0];
+    index[1]=|nibble[3:2];pair_bits=index[1]?nibble[3:2]:nibble[1:0];
+    index[0]=pair_bits[1];
+    msb_index25=index;
   end
 endfunction
 
@@ -86,36 +78,38 @@ function signed [5:0] encode_pack_shift;
   end
 endfunction
 
+// N2 retains only the destination significand and its carry. Guard/sticky
+// are derived from the original magnitude, before discarded bits disappear.
 function [19:0] pack_normalized_bf20;
   input zero;
   input sign;
-  input [24:0] magnitude;
+  input [21:0] magnitude;
   input signed [5:0] encoded_shift;
   input [7:0] normalized_exp_field;
-  reg [24:0] shifted;
+  reg [11:0] significand;
+  reg guard_bit,sticky_bit;
   reg [12:0] rounded;
-  integer exp_field,shift;
+  reg [8:0] exp_field;
+  integer shift;
   begin
-    exp_field = normalized_exp_field;
     shift=$signed(encoded_shift);
-    if(shift>0)shifted=rshift_rne25(magnitude,shift);
-    else shifted=magnitude<<(-shift);
-    if(zero)pack_normalized_bf20=0;
-    else begin
-      if(exp_field>=255)pack_normalized_bf20={sign,8'hfe,11'h7ff};
-      else if(exp_field>0)begin
-        rounded=shifted[12:0];
-        if(rounded[12])begin
-          rounded={1'b0,rounded[12:1]};
-          exp_field=exp_field+1;
-        end
-        if(exp_field>=255)pack_normalized_bf20={sign,8'hfe,11'h7ff};
-        else pack_normalized_bf20={sign,exp_field[7:0],rounded[10:0]};
-      end else begin
-        if(shifted>=25'd2048)pack_normalized_bf20={sign,8'h01,11'b0};
-        else pack_normalized_bf20={sign,8'h00,shifted[10:0]};
+    guard_bit=0;sticky_bit=0;
+    if(shift>0)begin
+      significand=magnitude>>shift;
+      if(shift<=22)begin
+        guard_bit=magnitude[shift-1];
+        sticky_bit=|(magnitude&((22'b1<<(shift-1))-1'b1));
       end
-    end
+    end else significand=magnitude<<(-shift);
+    rounded={1'b0,significand}+
+      {12'b0,(guard_bit&&(sticky_bit||significand[0]))};
+    exp_field={1'b0,normalized_exp_field}+{8'b0,rounded[12]};
+    if(zero)pack_normalized_bf20=0;
+    else if(normalized_exp_field==0)
+      pack_normalized_bf20={sign,7'b0,rounded[11],rounded[10:0]};
+    else if(exp_field>=255)pack_normalized_bf20={sign,8'hfe,11'h7ff};
+    else pack_normalized_bf20={sign,exp_field[7:0],
+      rounded[12]?rounded[11:1]:rounded[10:0]};
   end
 endfunction
 
