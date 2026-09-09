@@ -64,16 +64,6 @@ endfunction
 
 // N1 selects a single signed shift for normal and subnormal packing.
 // Positive means right shift with RNE; negative means exact left shift.
-function signed [5:0] encode_sub_shift;
-  input signed [9:0] max_exp;
-  reg signed [10:0] full_shift;
-  begin
-    full_shift=$signed({max_exp[9],max_exp})+11'sd5;
-    encode_sub_shift=(full_shift < -11'sd26) ? -6'sd26
-                   : (full_shift > 11'sd25) ? 6'sd25 : full_shift[5:0];
-  end
-endfunction
-
 function [7:0] encode_exp_field;
   input signed [10:0] exp_field;
   begin
@@ -86,9 +76,14 @@ function signed [5:0] encode_pack_shift;
   input [4:0] msb;
   input signed [9:0] max_exp;
   input signed [10:0] exp_field;
+  reg signed [10:0] sub_right_shift;
   begin
+    // exp_field = max_exp + msb - 7. In the subnormal branch,
+    // -max_exp-5 >= msb-12 >= -12, so only the large-right cap is needed.
+    sub_right_shift=-$signed({max_exp[9],max_exp})-11'sd5;
     encode_pack_shift=(exp_field <= 11'sd0)
-      ? -encode_sub_shift(max_exp) : ($signed({1'b0,msb}) - 6'sd13);
+      ? ((sub_right_shift > 11'sd26) ? 6'sd26 : sub_right_shift[5:0])
+      : ($signed({1'b0,msb}) - 6'sd13);
   end
 endfunction
 
@@ -125,19 +120,13 @@ function [21:0] pack_normalized_bf22;
   end
 endfunction
 
+// N2 emits finite BF22 only, including saturated finite overflow.
+// RNE retains signed zero and may naturally round finite BF22 to BF16 infinity.
 function [15:0] bf16_round_bits;
   input [21:0] bits;
-  reg [15:0] rounded;
   begin
-    if ((bits[20:13] == 8'hff) && (bits[12:0] != 13'b0))
-      rounded = 16'h7fc0;
-    else begin
-      rounded = bits[21:6]
-              + {15'b0, (bits[5] && (|bits[4:0] || bits[6]))};
-      if ((rounded == 16'h0000) && bits[21])
-        rounded = 16'h8000;
-    end
-    bf16_round_bits = rounded;
+    bf16_round_bits = bits[21:6]
+      + {15'b0, (bits[5] && (|bits[4:0] || bits[6]))};
   end
 endfunction
 
