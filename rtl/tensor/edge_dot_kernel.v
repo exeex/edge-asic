@@ -128,7 +128,7 @@ generate
     wire [8:0] raw_exp = weight_bf16_mode_i
       ? {1'b0,(ae==0 ? 8'd1 : ae)} + {1'b0,(we==0 ? 8'd1 : we)}
       : {1'b0,ae} + 9'd134;
-    always @(posedge clk) if(rst_b) begin
+    always @(posedge clk) begin
       s0_raw_exp[k] <= raw_exp;
       s0_eligible[k] <= activation_nonzero_i[k] && weight_nonzero_i[k];
       s1_raw_exp[k] <= s0_raw_exp[k];
@@ -140,7 +140,7 @@ generate
     wire [9:0] b={s0_eligible[4*k+1],s0_raw_exp[4*k+1]};
     wire [9:0] c={s0_eligible[4*k+2],s0_raw_exp[4*k+2]};
     wire [9:0] d={s0_eligible[4*k+3],s0_raw_exp[4*k+3]};
-    always @(posedge clk) if(rst_b) s1_group_max[k] <= max4_parallel(a,b,c,d);
+    always @(posedge clk) s1_group_max[k] <= max4_parallel(a,b,c,d);
     assign tree[GROUPS+k]=s1_group_max[k];
   end
   if(GROUPS==4) begin : FINAL_MAX4
@@ -515,7 +515,7 @@ generate
         reg sign_q;
         wire [7:0] i8_mag = s0_int8[lane_idx][7]
           ? -s0_int8[lane_idx] : s0_int8[lane_idx];
-        always @(posedge clk) if (rst_b) begin
+        always @(posedge clk) begin
           activation_sig_q <= {(s0_bf16[lane_idx][14:7]!=0),s0_bf16[lane_idx][6:0]};
           weight_sig_q <= s0_weight_bf16_mode
             ? {(s0_weight_bf16[lane_idx][14:7]!=0),s0_weight_bf16[lane_idx][6:0]} : i8_mag;
@@ -598,7 +598,7 @@ generate
         {s4_lane[group_idx*4+2][18], s4_lane[group_idx*4+2]} +
         {s4_lane[group_idx*4+3][18], s4_lane[group_idx*4+3]};
       always @(posedge clk) begin
-        if (rst_b) s5a_group[group_idx] <=
+        s5a_group[group_idx] <=
           {pair01[19], pair01} + {pair23[19], pair23};
       end
     end
@@ -615,7 +615,7 @@ generate
         s5a_rsum_last <= s4_rsum_last;
       end
     end
-    always @(posedge clk) if (rst_b) s5a_exp <= s4_max_exp;
+    always @(posedge clk) s5a_exp <= s4_max_exp;
     wire signed [21:0] half01 =
       {s5a_group[0][20], s5a_group[0]} + {s5a_group[1][20], s5a_group[1]};
     wire signed [21:0] half23 =
@@ -1071,6 +1071,16 @@ function [31:0] normalize_sum_to_fp32;
   end
 endfunction
 
+// Product data has no reset value or feedback semantics. Valid reset cancels
+// in-flight data; unconditional capture avoids a reset-hold mux on the multiplier.
+integer product_lane;
+always @(posedge clk) begin
+  for (product_lane = 0; product_lane < LANES; product_lane = product_lane + 1) begin
+    s2_prod[product_lane] <= PARALLEL_MAX_SHIFT ? parallel_product[product_lane] : s1_prod[product_lane];
+    s2_sign[product_lane] <= PARALLEL_MAX_SHIFT ? parallel_sign[product_lane] : s1_sign[product_lane];
+  end
+end
+
 always @(posedge clk or negedge rst_b) begin
   if (!rst_b) begin
     s0_valid <= 1'b0;
@@ -1080,8 +1090,6 @@ always @(posedge clk or negedge rst_b) begin
     s4_valid <= 1'b0;
     s5_valid <= 1'b0;
     s6_valid <= 1'b0;
-    s6_bf16 <= 16'b0;
-    s6_bf22_bits <= 32'b0;
     s0_rsum_enable <= 1'b0;
     s1_rsum_enable <= 1'b0;
     s2_rsum_enable <= 1'b0;
@@ -1147,6 +1155,12 @@ always @(posedge clk or negedge rst_b) begin
       end
     end
 
+
+  end
+end
+
+// Free-running numerical pipeline; reset flushes validity, not payload.
+always @(posedge clk) begin
     for (i = 0; i < LANES; i = i + 1) begin
       s0_bf16[i] <= ingress_activation[i];
       s0_int8[i] <= int8_vec_i[i*8 +: 8];
@@ -1169,8 +1183,6 @@ always @(posedge clk or negedge rst_b) begin
 
     s2_max_exp <= max_exp_comb;
     for (i = 0; i < LANES; i = i + 1) begin
-      s2_prod[i] <= PARALLEL_MAX_SHIFT ? parallel_product[i] : s1_prod[i];
-      s2_sign[i] <= PARALLEL_MAX_SHIFT ? parallel_sign[i] : s1_sign[i];
       s2_shift[i] <= {($signed(parallel_shift[i*11+:11]) >= (17 + ALIGN_GUARD_BITS)),
                       parallel_shift[i*11+:5]};
       s2_exp[i] <= s1_exp[i];
@@ -1197,7 +1209,6 @@ always @(posedge clk or negedge rst_b) begin
     s6_bf16 <= normalize_sum_to_bf16(s5_sum, s5_max_exp);
     s6_bf22_bits <= bf22_round_bits(
         normalize_sum_to_fp32(s5_sum, s5_max_exp));
-  end
 end
 
 endmodule
