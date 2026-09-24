@@ -1,5 +1,24 @@
 # Fragmented SRAM prototype
 
+## Phase-butterfly H4 compatibility path
+
+`edge_sram_h4_tile32k` is a separate functional composition of four 8 KiB
+H2 tiles (64 `fakeram_512x8` macros).  Four such tiles plus
+`edge_sram_h4_bank16_wrapper` replace one legacy 128 KiB bank16 raw slice
+without changing its address-to-byte mapping or 128 bytes/cycle maximum raw
+width.  The wrapper owns channel/pair/byte/depth routing; the H1/H2/H4
+children only perform their registered phase butterflies.  H2 now accepts a
+one-bit per-byte half-route input so both H1 quartets are reachable, while
+the physical 512x8 row pin remains 9 bits.
+
+This path adds one registered request cut and thus one read-response cycle
+relative to the old raw bank16.  Its 256-hop H1 phase chain requires a
+256-clock reset/wake fill before the wrapper admits requests.  The E4 A/B
+test checks functional compatibility and eight-route throughput; it is not
+yet a hardened macro, product backend switch, APR timing result, or tensor
+deskew integration.  The previously implemented 64 KiB-fragment path below
+remains independent.
+
 This independent shared-ASIC RTL is deliberately named `sram`, not `dtcm`.
 One `edge_sram_quad64k` owns 64 KiB: four 128-bit pair positions, 1024 rows,
 implemented by two `edge_sram_h1_array32k` depth halves (128
