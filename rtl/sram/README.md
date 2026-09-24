@@ -2,10 +2,12 @@
 
 This independent shared-ASIC RTL is deliberately named `sram`, not `dtcm`.
 One `edge_sram_quad64k` owns 64 KiB: four 128-bit pair positions, 1024 rows,
-implemented by sixteen `edge_sram_h1_tile4k` blocks (128 `fakeram_512x8`
-leaves).  The H1 tile remains eight single-port 512x8 macros with a four-by-four
-butterfly.  Its eight lanes are now assigned to four pair positions and two
-adjacent byte lanes, rather than eight pair positions of one byte lane.
+implemented by two `edge_sram_h1_array32k` depth halves (128
+`fakeram_512x8` leaves in total).  Each 32 KiB half contains eight 4 KiB H1
+tiles, 64 single-port macros, and no depth merge.  Their eight byte lanes
+per tile are assigned to four pair positions and two adjacent bytes.  Address
+bit 9 selects the 32 KiB half at the 64 KiB boundary; only bits 8:0 reach
+the SRAM pins.  The one-wire H1 chain has 128 hops per 64 KiB fragment.
 
 The compatibility shell `edge_sram_legacy_bank16_wrapper` replaces **one**
 legacy 128 KiB bank16 raw slice with two 64 KiB fragments.  The two existing
@@ -27,7 +29,8 @@ compatibility wrapper preserves the existing four upper and four lower raw
 routes *per legacy slice*, their fixed windows, byte strobes, and four-edge
 read latency.  The wrapper owns the legacy H4 permutation, each fragment
 registers its already-selected local pair boundary (H2 timing cut), and each
-4 KiB tile registers H1.  A physically local H2 mux remains to be designed.
+4 KiB tile registers H1.  Physically local H2 and H4 muxes within the 32 KiB
+boundary remain to be designed.
 It does not queue/retry requests or lend an idle SRAM phase.
 
 This is equivalence-first RTL, **not a hardened 64 KiB macro**.  Its phase
