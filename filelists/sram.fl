@@ -1,0 +1,3 @@
+rtl/sram/edge_sram_h1_tile4k.v
+rtl/sram/edge_sram_quad64k.v
+rtl/sram/edge_sram_legacy_bank16_wrapper.v
