@@ -28,14 +28,36 @@ module edge_sram_h1_tile8k (
                                   && (depth_select[lane] == 1'(depth));
       assign row_addr[lane*9 +: 9] = req_addr_i[lane*10 +: 9];
     end
+`ifdef EDGE_SRAM_H1_HARDENED_FACES
+    if (depth == 0) begin: HARD_NORTH
+      edge_sram_h1_tile4k_north x_row (
+        .clk(clk), .rst_b(rst_b), .phase_i(phase_link[depth]),
+        .phase_o(phase_link[depth+1]),
+        .req_valid_i(row_valid), .req_write_i(req_write_i),
+        .req_wstrb_i(req_wstrb_i), .req_addr_i(row_addr),
+        .req_wdata_i(req_wdata_i),
+        .rsp_valid_o(row_rsp_valid[depth]),
+        .rsp_data_o(row_rsp_data[depth]));
+    end else begin: HARD_SOUTH
+      edge_sram_h1_tile4k_south x_row (
+        .clk(clk), .rst_b(rst_b), .phase_i(phase_link[depth]),
+        .phase_o(phase_link[depth+1]),
+        .req_valid_i(row_valid), .req_write_i(req_write_i),
+        .req_wstrb_i(req_wstrb_i), .req_addr_i(row_addr),
+        .req_wdata_i(req_wdata_i),
+        .rsp_valid_o(row_rsp_valid[depth]),
+        .rsp_data_o(row_rsp_data[depth]));
+    end
+`else
     edge_sram_h1_tile4k x_row (
       .clk(clk), .rst_b(rst_b), .phase_i(phase_link[depth]),
       .phase_o(phase_link[depth+1]),
       .req_valid_i(row_valid), .req_write_i(req_write_i),
       .req_wstrb_i(req_wstrb_i), .req_addr_i(row_addr),
       .req_wdata_i(req_wdata_i),
-      .rsp_valid_o(row_rsp_valid[depth]),
-      .rsp_data_o(row_rsp_data[depth]));
+        .rsp_valid_o(row_rsp_valid[depth]),
+        .rsp_data_o(row_rsp_data[depth]));
+`endif
   end endgenerate
 
   // The 4 KiB H1 command cut and synchronous SRAM read take two clocks from
