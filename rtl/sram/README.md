@@ -1,10 +1,23 @@
 # Fragmented SRAM prototype
 
+## Layer ownership
+
+This directory owns SRAM storage and reusable H1/H2/H4 compositions. It does
+not define DTCM client protocols or product compatibility wrappers. E3's
+`edge_dtcm_h4_wrapper` lives in `edge-e3/edge_dtcm_subsys/rtl`; E4's
+`edge_e4_dtcm_h4_wrapper` and `edge_e4_dtcm_legacy_sram_wrapper` live in
+`edge-e4/edge_dtcm_subsys/rtl`. DTCM owns address/phase translation and
+response tags and instantiates these SRAM units.
+
+The inferred SRAM model `edge_dtcm_spsram_1024x64` is stored here as well.
+Its historical module name is retained as the OpenROAD macro replacement
+key; it contains only the memory behavior, with no DTCM routing.
+
 ## Phase-butterfly H4 compatibility path
 
 `edge_sram_h4_tile32k` is a separate functional composition of four 8 KiB
 H2 tiles (64 `fakeram_512x8` macros).  Four such tiles plus
-`edge_sram_h4_bank16_wrapper` replace one legacy 128 KiB bank16 raw slice
+`edge_e4_dtcm_h4_wrapper` replace one legacy 128 KiB bank16 raw slice
 without changing its address-to-byte mapping or 128 bytes/cycle maximum raw
 width.  The wrapper owns channel/pair/byte/depth routing; the H1/H2/H4
 children only perform their registered phase butterflies.  H2 now accepts a
@@ -28,7 +41,7 @@ per tile are assigned to four pair positions and two adjacent bytes.  Address
 bit 9 selects the 32 KiB half at the 64 KiB boundary; only bits 8:0 reach
 the SRAM pins.  The one-wire H1 chain has 128 hops per 64 KiB fragment.
 
-The compatibility shell `edge_sram_legacy_bank16_wrapper` replaces **one**
+The compatibility shell `edge_e4_dtcm_legacy_sram_wrapper` replaces **one**
 legacy 128 KiB bank16 raw slice with two 64 KiB fragments.  The two existing
 E4 slices would therefore become four fragments without changing 256 KiB
 capacity.  For the existing byte offset:

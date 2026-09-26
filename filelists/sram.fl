@@ -3,4 +3,6 @@ rtl/sram/edge_sram_h1_tile4k_faces.v
 rtl/sram/edge_sram_h1_tile8k.v
 rtl/sram/edge_sram_h1_array32k.v
 rtl/sram/edge_sram_quad64k.v
-rtl/sram/edge_sram_legacy_bank16_wrapper.v
+rtl/sram/edge_sram_h2_tile8k.v
+rtl/sram/edge_sram_h4_tile32k.v
+rtl/sram/edge_dtcm_spsram_1024x64.v
