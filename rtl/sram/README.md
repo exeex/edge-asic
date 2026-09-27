@@ -24,8 +24,9 @@ children only perform their registered phase butterflies.  H2 now accepts a
 one-bit per-byte half-route input so both H1 quartets are reachable, while
 the physical 512x8 row pin remains 9 bits.
 
-This path adds one registered request cut and thus one read-response cycle
-relative to the old raw bank16.  Its 256-hop H1 phase chain requires a
+H4 has three sampling edges (H4, H2, H1/SRAM). The DTCM wrapper owns
+the fourth edge: E3 registers the response, and E4 registers the request.
+Both wrappers preserve four-edge client response latency.  Its 256-hop H1 phase chain requires a
 256-clock reset/wake fill before the wrapper admits requests.  The E4 A/B
 test checks functional compatibility and eight-route throughput; it is not
 yet a hardened macro, product backend switch, APR timing result, or tensor

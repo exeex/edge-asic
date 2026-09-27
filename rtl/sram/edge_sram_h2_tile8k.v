@@ -12,7 +12,9 @@ module edge_sram_h2_phase_hop (
   assign phase_o = ~delay_q[1];
 endmodule
 
-module edge_sram_h2_tile8k (
+module edge_sram_h2_tile8k #(
+  parameter H1_COMMAND_REGISTER = 1
+)(
   input wire clk, rst_b,
   input wire phase_h1_i, phase_h2_i,
   output wire phase_h1_o, phase_h2_o,
@@ -141,7 +143,7 @@ module edge_sram_h2_tile8k (
 `ifdef EDGE_SRAM_H1_HARDENED_FACES
   edge_sram_h1_tile4k_north x_north (
 `else
-  edge_sram_h1_tile4k x_north (
+  edge_sram_h1_tile4k #(.COMMAND_REGISTER(H1_COMMAND_REGISTER)) x_north (
 `endif
     .clk(clk), .rst_b(rst_b), .phase_i(h1_link[0]),
     .phase_o(h1_link[1]), .req_valid_i(north_h1_valid),
@@ -150,10 +152,11 @@ module edge_sram_h2_tile8k (
     .req_addr_i(north_h1_addr),
     .req_wdata_i(north_h1_data),
     .rsp_valid_o(north_rsp_valid), .rsp_data_o(north_rsp_data));
+
 `ifdef EDGE_SRAM_H1_HARDENED_FACES
   edge_sram_h1_tile4k_south x_south (
 `else
-  edge_sram_h1_tile4k x_south (
+  edge_sram_h1_tile4k #(.COMMAND_REGISTER(H1_COMMAND_REGISTER)) x_south (
 `endif
     .clk(clk), .rst_b(rst_b), .phase_i(h1_link[1]),
     .phase_o(h1_link[2]), .req_valid_i(south_h1_valid),
@@ -163,25 +166,37 @@ module edge_sram_h2_tile8k (
     .req_wdata_i(south_h1_data),
     .rsp_valid_o(south_rsp_valid), .rsp_data_o(south_rsp_data));
 
+
+`ifdef EDGE_SRAM_H1_HARDENED_FACES
+  // Existing physical masters include a command cut and cannot implement
+  // the one-edge H1/SRAM variant. Refuse that combination at elaboration.
+  generate if (!H1_COMMAND_REGISTER) begin: INCOMPATIBLE_HARD_FACES
+    edge_sram_h1_single_edge_hard_faces_are_not_available invalid_configuration();
+  end endgenerate
+`endif
+
   genvar lane;
+  wire response_swap = H1_COMMAND_REGISTER ? south_tag_d2_q : south_tag_d1_q;
+  wire [3:0] north_response_half = H1_COMMAND_REGISTER ? north_half_d2_q : north_half_d1_q;
+  wire [3:0] south_response_half = H1_COMMAND_REGISTER ? south_half_d2_q : south_half_d1_q;
   generate for (lane=0; lane<4; lane=lane+1) begin: RESPONSE
-    wire [7:0] north_byte = north_half_d2_q[lane]
+    wire [7:0] north_byte = north_response_half[lane]
         ? north_rsp_data[(lane+4)*8 +: 8]
         : north_rsp_data[lane*8 +: 8];
-    wire [7:0] south_byte = south_half_d2_q[lane]
+    wire [7:0] south_byte = south_response_half[lane]
         ? south_rsp_data[(lane+4)*8 +: 8]
         : south_rsp_data[lane*8 +: 8];
-    wire north_valid = north_half_d2_q[lane]
+    wire north_valid = north_response_half[lane]
         ? north_rsp_valid[lane+4] : north_rsp_valid[lane];
-    wire south_valid = south_half_d2_q[lane]
+    wire south_valid = south_response_half[lane]
         ? south_rsp_valid[lane+4] : south_rsp_valid[lane];
-    assign rsp_valid_o[lane] = south_tag_d2_q
+    assign rsp_valid_o[lane] = response_swap
         ? south_valid : north_valid;
-    assign rsp_valid_o[lane+4] = south_tag_d2_q
+    assign rsp_valid_o[lane+4] = response_swap
         ? north_valid : south_valid;
-    assign rsp_data_o[lane*8 +: 8] = south_tag_d2_q
+    assign rsp_data_o[lane*8 +: 8] = response_swap
         ? south_byte : north_byte;
-    assign rsp_data_o[(lane+4)*8 +: 8] = south_tag_d2_q
+    assign rsp_data_o[(lane+4)*8 +: 8] = response_swap
         ? north_byte : south_byte;
   end endgenerate
 

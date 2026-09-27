@@ -50,7 +50,7 @@ module edge_sram_h4_tile32k (
   reg [31:0] valid_q, write_q, strb_q, bank_half_q;
   reg [287:0] addr_q;
   reg [255:0] data_q;
-  reg swap_q, swap_d1_q, swap_d2_q, swap_d3_q;
+  reg swap_q, swap_d1_q, swap_d2_q;
   always @(posedge clk or negedge rst_b)
     if (!rst_b) valid_q <= 32'b0;
     else valid_q <= {32{phase_ready_o}} &
@@ -70,14 +70,13 @@ module edge_sram_h4_tile32k (
     swap_q <= swap;
     swap_d1_q <= swap_q;
     swap_d2_q <= swap_d1_q;
-    swap_d3_q <= swap_d2_q;
   end
 
   wire [31:0] child_valid;
   wire [255:0] child_data;
   wire [3:0] child_ready;
   generate for (tile=0; tile<4; tile=tile+1) begin: H2
-    edge_sram_h2_tile8k x_tile (
+    edge_sram_h2_tile8k #(.H1_COMMAND_REGISTER(0)) x_tile (
       .clk(clk), .rst_b(rst_b),
       .phase_h1_i(h1_link[tile]), .phase_h2_i(h2_link[tile]),
       .phase_h1_o(h1_link[tile+1]), .phase_h2_o(h2_link[tile+1]),
@@ -92,9 +91,9 @@ module edge_sram_h4_tile32k (
       .rsp_data_o(child_data[tile*64 +: 64]));
   end endgenerate
 
-  assign rsp_valid_o = swap_d3_q
+  assign rsp_valid_o = swap_d2_q
       ? {child_valid[15:0], child_valid[31:16]} : child_valid;
-  assign rsp_data_o = swap_d3_q
+  assign rsp_data_o = swap_d2_q
       ? {child_data[127:0], child_data[255:128]} : child_data;
 
 `ifndef SYNTHESIS

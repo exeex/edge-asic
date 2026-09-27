@@ -2,7 +2,11 @@
 // assign the eight leaves to four pair positions times two adjacent bytes.
 // The phase chain is reset to the aligned state (phase_i=0), so a composed
 // array does not need 8*N startup cycles before its first legal request.
-module edge_sram_h1_tile4k (
+module edge_sram_h1_tile4k #(
+  // H4 counts the synchronous SRAM edge as its H1 cut. Standalone H1 APR
+  // fixtures retain the historical command register by default.
+  parameter COMMAND_REGISTER = 1
+)(
   input wire clk, rst_b, phase_i,
   output wire phase_o,
   input wire [7:0] req_valid_i, req_write_i, req_wstrb_i,
@@ -28,20 +32,35 @@ module edge_sram_h1_tile4k (
   wire [7:0] door_strb = swap ? {req_wstrb_i[3:0],req_wstrb_i[7:4]} : req_wstrb_i;
   wire [71:0] door_addr = swap ? {req_addr_i[35:0],req_addr_i[71:36]} : req_addr_i;
   wire [63:0] door_data = swap ? {req_wdata_i[31:0],req_wdata_i[63:32]} : req_wdata_i;
-  reg [7:0] cmd_valid_q, cmd_write_q, cmd_strb_q;
-  reg [71:0] cmd_addr_q;
-  reg [63:0] cmd_data_q;
-  reg swap_q;
+  wire [7:0] cmd_valid_q, cmd_write_q, cmd_strb_q;
+  wire [71:0] cmd_addr_q;
+  wire [63:0] cmd_data_q;
+  wire swap_q;
+  generate if (COMMAND_REGISTER) begin: REGISTERED_COMMAND
+  reg [7:0] valid_q, write_q, strb_q;
+  reg [71:0] addr_q;
+  reg [63:0] data_q;
+  reg phase_q;
   always @(posedge clk or negedge rst_b)
-    if (!rst_b) cmd_valid_q <= 8'b0;
-    else cmd_valid_q <= door_valid;
+    if (!rst_b) valid_q <= 8'b0;
+    else valid_q <= door_valid;
   always @(posedge clk) begin
-    cmd_write_q <= door_write;
-    cmd_strb_q <= door_strb;
-    cmd_addr_q <= door_addr;
-    cmd_data_q <= door_data;
-    swap_q <= swap;
+    write_q <= door_write;
+    strb_q <= door_strb;
+    addr_q <= door_addr;
+    data_q <= door_data;
+    phase_q <= swap;
   end
+  assign {cmd_valid_q,cmd_write_q,cmd_strb_q,cmd_addr_q,cmd_data_q,swap_q} =
+      {valid_q,write_q,strb_q,addr_q,data_q,phase_q};
+  end else begin: SRAM_COMMAND
+    assign cmd_valid_q = door_valid & {8{rst_b}};
+    assign cmd_write_q = door_write;
+    assign cmd_strb_q = door_strb;
+    assign cmd_addr_q = door_addr;
+    assign cmd_data_q = door_data;
+    assign swap_q = swap;
+  end endgenerate
   wire [63:0] ram_data;
   genvar lane;
   generate for (lane=0; lane<8; lane=lane+1) begin: SRAM
