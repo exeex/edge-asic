@@ -6,3 +6,5 @@ rtl/sram/edge_sram_quad64k.v
 rtl/sram/edge_sram_h2_tile8k.v
 rtl/sram/edge_sram_h4_tile32k.v
 rtl/sram/edge_dtcm_spsram_1024x64.v
+rtl/sram/edge_sram_h2_tile8k_h4.v
+rtl/sram/edge_sram_h4_tile16k.v

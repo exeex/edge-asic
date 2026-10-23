@@ -76,7 +76,11 @@ module edge_sram_h4_tile32k (
   wire [255:0] child_data;
   wire [3:0] child_ready;
   generate for (tile=0; tile<4; tile=tile+1) begin: H2
+`ifdef EDGE_SRAM_H2_HARDENED
+    edge_sram_h2_tile8k_h4 x_tile (
+`else
     edge_sram_h2_tile8k #(.H1_COMMAND_REGISTER(0)) x_tile (
+`endif
       .clk(clk), .rst_b(rst_b),
       .phase_h1_i(h1_link[tile]), .phase_h2_i(h2_link[tile]),
       .phase_h1_o(h1_link[tile+1]), .phase_h2_o(h2_link[tile+1]),
