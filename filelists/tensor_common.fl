@@ -1,3 +1,8 @@
 rtl/tensor/edge_bf16_sig_mul.v
 rtl/tensor/edge_dot_kernel.v
 rtl/tensor/edge_psum.v
+rtl/tensor/edge_wld_packed_router.v
+rtl/tensor/edge_wld_packed_vectors.v
+rtl/tensor/edge_wld_dot_ingress.v
+rtl/tensor/edge_wld_relay_cell.v
+rtl/tensor/edge_wld_relay_router.v
