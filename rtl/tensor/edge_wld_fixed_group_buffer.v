@@ -1,19 +1,19 @@
 // Fixed packed pages: mode-specific static scatter, sequential pair drain.
 // Full transaction storage; no per-slot variable input selection or relocation.
 module edge_wld_fixed_group_buffer #(
- parameter DOTS=8, parameter LANES=2, parameter DEPTH=LANES*DOTS/2,
+ parameter WTYPE_BITS=2, parameter DOTS=8, parameter LANES=2, parameter DEPTH=LANES*DOTS/2,
  parameter GROUPS=DOTS/LANES, parameter PB=$clog2(DEPTH), parameter IB=$clog2(DOTS), parameter LB=$clog2(LANES)
 )(
  input wire clk,rst_b,start_i, output wire start_ready_o,
- input wire [1:0] wtype_i, input wire transpose_i,
+ input wire [WTYPE_BITS-1:0] wtype_i, input wire transpose_i,
  input wire load_valid_i, output wire load_ready_o,
  input wire [DOTS*16-1:0] load_data_i,
  output wire [GROUPS-1:0] drain_valid_o, input wire drain_ready_i,
  output wire [GROUPS*32-1:0] drain_data_o,
  output wire [GROUPS*2-1:0] drain_lane_o,
- output wire [1:0] wtype_o, output wire busy_o, output reg done_o
+ output wire [WTYPE_BITS-1:0] wtype_o, output wire busy_o, output reg done_o
 );
- reg active_q,trans_q; reg [1:0] type_q;
+ reg active_q,trans_q; reg [WTYPE_BITS-1:0] type_q;
  reg [IB:0] beat_q;
  wire [1:0] wc=type_q==0?0:type_q==3?2:1;
  wire [IB:0] limit=(IB+1)'(DOTS)>>wc;
