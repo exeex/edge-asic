@@ -1,8 +1,9 @@
-// Multi-outstanding single-beat AXI reader with an SRAM-backed DTCM sink FIFO.
+// Ordered AXI reader with optional contiguous-command burst gathering.
 module edge_dma_a2d_stream #(
   parameter AXI_ADDR_WIDTH = 40,
   parameter DTCM_ADDR_WIDTH = 14,
   parameter FIFO_DEPTH = 16,
+  parameter BURST_MAX_BEATS = 1,
   parameter FIFO_PTR_WIDTH = (FIFO_DEPTH <= 2) ? 1 : $clog2(FIFO_DEPTH)
 ) (
   input  wire                       clk,
@@ -55,12 +56,58 @@ module edge_dma_a2d_stream #(
   wire dtcm_fire;
   reg [2:0] lease_phase_q;
 
-  assign cmd_ready = !reserved_full && !descriptor_full && axi_arready;
-  assign axi_arvalid = cmd_valid && !reserved_full && !descriptor_full;
-  assign axi_araddr = cmd_axi_addr;
-  assign axi_arlen = 8'd0;
+  wire cmd_fire = cmd_valid && cmd_ready;
+  wire [FIFO_PTR_WIDTH:0] pending_count;
+  wire [DTCM_ADDR_WIDTH-1:0] lease_addr;
+  generate if (BURST_MAX_BEATS == 1) begin: SINGLE_BEAT
+    assign cmd_ready = !reserved_full && !descriptor_full && axi_arready;
+    assign axi_arvalid = cmd_valid && !reserved_full && !descriptor_full;
+    assign axi_araddr = cmd_axi_addr;
+    assign axi_arlen = 8'd0;
+    assign pending_count = 0;
+    assign lease_addr = cmd_dtcm_addr;
+  end else begin: BURST
+    reg [AXI_ADDR_WIDTH-1:0] base_q, next_axi_q;
+    reg [DTCM_ADDR_WIDTH-1:0] first_dtcm_q, next_dtcm_q;
+    reg [FIFO_PTR_WIDTH:0] count_q;
+    reg sealed_q;
+    wire contiguous = cmd_axi_addr == next_axi_q &&
+                      cmd_dtcm_addr == next_dtcm_q &&
+                      cmd_axi_addr[AXI_ADDR_WIDTH-1:12] == base_q[AXI_ADDR_WIDTH-1:12];
+    assign pending_count = count_q;
+    assign cmd_ready = !sealed_q && !reserved_full && !descriptor_full &&
+                       (count_q == 0 || contiguous);
+    assign axi_arvalid = sealed_q;
+    assign axi_araddr = base_q;
+    assign axi_arlen = 8'(count_q - 1'b1);
+    assign lease_addr = first_dtcm_q;
+    always @(posedge clk or negedge reset_b) begin
+      if (!reset_b) begin
+        base_q <= 0; next_axi_q <= 0; first_dtcm_q <= 0;
+        next_dtcm_q <= 0; count_q <= 0; sealed_q <= 0;
+      end else begin
+        // A gap flushes a short tail. Credit pressure from older responses
+        // does not seal a small burst: their DTCM drain will free credits.
+        if (count_q != 0 && (!cmd_valid || !contiguous ||
+            (reserved_full && descriptor_count_q == count_q && fifo_occupancy == 0)))
+          sealed_q <= 1;
+        if (cmd_fire) begin
+          if (count_q == 0) begin
+            base_q <= cmd_axi_addr;
+            first_dtcm_q <= cmd_dtcm_addr;
+          end
+          next_axi_q <= cmd_axi_addr + AXI_ADDR_WIDTH'(16);
+          next_dtcm_q <= cmd_dtcm_addr + DTCM_ADDR_WIDTH'(2);
+          count_q <= count_q + 1'b1;
+          if (count_q + 1'b1 == BURST_MAX_BEATS || cmd_axi_addr[11:0] == 12'hff0)
+            sealed_q <= 1;
+        end
+        if (ar_fire) begin count_q <= 0; sealed_q <= 0; end
+      end
+    end
+  end endgenerate
   assign ar_fire = axi_arvalid && axi_arready;
-  assign axi_rready = !descriptor_empty && fifo_push_ready;
+  assign axi_rready = (descriptor_count_q > pending_count) && fifo_push_ready;
   assign r_fire = axi_rvalid && axi_rready;
   assign dtcm_req = fifo_pop_valid;
   assign dtcm_addr = fifo_pop_meta[DTCM_ADDR_WIDTH-1:0];
@@ -69,12 +116,12 @@ module edge_dma_a2d_stream #(
   assign dtcm_fire = fifo_pop_valid && dtcm_ready;
   assign beat_done = dtcm_fire;
   assign busy = !descriptor_empty || (fifo_occupancy != 0);
-  assign outstanding_count = descriptor_count_q;
+  assign outstanding_count = descriptor_count_q - pending_count;
   assign buffered_count = fifo_occupancy;
   assign lease_valid = ar_fire;
-  assign lease_channel = cmd_dtcm_addr[3:1] -
+  assign lease_channel = lease_addr[3:1] -
                          (lease_phase_q + 3'd3);
-  assign lease_cycles = 9'd1;
+  assign lease_cycles = {1'b0, axi_arlen} + 9'd1;
   assign lease_delay = 4'd3;
 
   edge_dma_read_fifo #(
@@ -103,13 +150,13 @@ module edge_dma_a2d_stream #(
       lease_phase_q <= 3'b0;
     end else begin
       lease_phase_q <= lease_phase_q + 1'b1;
-      if (ar_fire) begin
+      if (cmd_fire) begin
         descriptor_q[descriptor_write_ptr_q] <= cmd_dtcm_addr;
         descriptor_write_ptr_q <= descriptor_write_ptr_q + 1'b1;
       end
       if (r_fire)
         descriptor_read_ptr_q <= descriptor_read_ptr_q + 1'b1;
-      case ({ar_fire, r_fire})
+      case ({cmd_fire, r_fire})
         2'b10: descriptor_count_q <= descriptor_count_q + 1'b1;
         2'b01: descriptor_count_q <= descriptor_count_q - 1'b1;
         default: descriptor_count_q <= descriptor_count_q;
@@ -117,4 +164,15 @@ module edge_dma_a2d_stream #(
     end
   end
 
+`ifndef SYNTHESIS
+  initial begin
+    if (BURST_MAX_BEATS < 1 || BURST_MAX_BEATS > FIFO_DEPTH || BURST_MAX_BEATS > 256 ||
+        FIFO_DEPTH != (1 << FIFO_PTR_WIDTH)) $fatal(1, "invalid DMA burst/FIFO parameters");
+  end
+  always @(posedge clk) if (reset_b) begin
+    if (({1'b0,descriptor_count_q} + {1'b0,fifo_occupancy}) > FIFO_DEPTH)
+      $fatal(1, "DMA response credits exceeded");
+    if (cmd_fire && cmd_axi_addr[3:0] != 0) $fatal(1, "unaligned DMA stream command");
+  end
+`endif
 endmodule
