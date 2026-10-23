@@ -11,8 +11,11 @@ module edge_sram_h4_phase_hop (
   assign phase_o = ~delay_q[3];
 endmodule
 
-module edge_sram_h4_tile32k (
+module edge_sram_h4_tile32k #(
+  parameter EXPLICIT_SWAP = 0
+)(
   input wire clk, rst_b,
+  input wire swap_i,
   input wire phase_h1_i, phase_h2_i, phase_h4_i,
   output wire phase_h1_o, phase_h2_o, phase_h4_o,
   output wire phase_ready_o,
@@ -46,7 +49,10 @@ module edge_sram_h4_tile32k (
     else if (fill_q != 7'd64) fill_q <= fill_q + 7'd1;
   assign phase_ready_o = (fill_q == 7'd64);
 
-  wire swap = h4_link[2];
+  // Optional request-time commutator control. The response follows the
+  // captured swap tag, never the current control. Legacy users keep the
+  // canonical phase chain and need not connect swap_i.
+  wire swap = EXPLICIT_SWAP ? swap_i : h4_link[2];
   reg [31:0] valid_q, write_q, strb_q, bank_half_q;
   reg [287:0] addr_q;
   reg [255:0] data_q;
