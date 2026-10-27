@@ -4,7 +4,7 @@
 
 This directory owns SRAM storage and reusable H1/H2/H4 compositions. It does
 not define DTCM client protocols or product compatibility wrappers. E3's
-`edge_dtcm_h4_wrapper` lives in `edge-e3/edge_dtcm_subsys/rtl`; E4's
+`edge_dtcm_h4` lives in `edge-e3/edge_dtcm_subsys/rtl`; E4's
 `edge_e4_dtcm_h4_wrapper` and `edge_e4_dtcm_legacy_sram_wrapper` live in
 `edge-e4/edge_dtcm_subsys/rtl`. DTCM owns address/phase translation and
 response tags and instantiates these SRAM units.
